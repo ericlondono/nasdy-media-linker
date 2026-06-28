@@ -19,10 +19,11 @@ echo "Starting NASDY Media Linker..."
 docker run -d \
   --name="$CONTAINER_NAME" \
   --restart unless-stopped \
+  --user 99:100 \
   -p 8088:8088 \
   -e DOWNLOADS_ROOT=/downloads \
-  -e MOVIES_ROOT="/media/Movies" \
-  -e TV_ROOT="/media/TV Shows" \
+  -e MOVIES_ROOT="/media/movies" \
+  -e TV_ROOT="/media/tv" \
   -e HOST_DOWNLOADS_ROOT="/mnt/user/NASDY/downloads" \
   -e HOST_MEDIA_ROOT="/mnt/user/NASDY/media" \
   -v "/mnt/user/NASDY/downloads:/downloads" \
