@@ -3,6 +3,7 @@ import requests
 from app.services.utils import find_videos, guess_type, strip_release_words, detect_year, detect_season
 from app.services.storage import load_import_db
 
+
 def normalize_source_path(raw_path: str):
     if not raw_path:
         return ""
@@ -11,45 +12,76 @@ def normalize_source_path(raw_path: str):
     p = p.replace("/mnt/user/downloads", "/downloads")
     return p
 
+
 def qbit_session(settings):
     s = requests.Session()
     url = settings.get("qbittorrent_url", "").rstrip("/")
     username = settings.get("qbittorrent_username", "")
     password = settings.get("qbittorrent_password", "")
-    if not url or not username:
-        raise ValueError("qBittorrent URL and username are required.")
-    r = s.post(f"{url}/api/v2/auth/login", data={"username": username, "password": password}, timeout=8)
+
+    if not url:
+        raise ValueError("qBittorrent URL is required.")
+    if not username:
+        raise ValueError("qBittorrent username is required.")
+
+    r = s.post(
+        f"{url}/api/v2/auth/login",
+        data={"username": username, "password": password},
+        timeout=8,
+    )
+
     if r.status_code != 200 or "Ok." not in r.text:
         raise ValueError(f"qBittorrent login failed. HTTP {r.status_code}: {r.text[:80]}")
+
     return s, url
 
-def qbit_completed_items(settings):
+
+def qbit_torrents(settings):
     session, url = qbit_session(settings)
     r = session.get(f"{url}/api/v2/torrents/info", timeout=10)
     r.raise_for_status()
-    torrents = r.json()
+    return r.json()
+
+
+def resolve_torrent_source(torrent):
+    candidates = []
+
+    content_path = normalize_source_path(torrent.get("content_path") or "")
+    save_path = normalize_source_path(torrent.get("save_path") or "")
+    name = torrent.get("name") or ""
+
+    if content_path:
+        candidates.append(Path(content_path))
+
+    if save_path and name:
+        candidates.append(Path(save_path) / name)
+
+    if save_path:
+        candidates.append(Path(save_path))
+
+    for candidate in candidates:
+        if candidate.is_file():
+            candidate = candidate.parent
+        if candidate.exists():
+            videos = find_videos(candidate)
+            if videos:
+                return candidate, videos
+
+    return None, []
+
+
+def qbit_completed_items(settings):
+    torrents = qbit_torrents(settings)
     db = load_import_db()
     items = []
 
     for t in torrents:
-        if float(t.get("progress", 0)) < 1:
+        progress = float(t.get("progress", 0))
+        if progress < 1:
             continue
 
-        content_path = normalize_source_path(t.get("content_path") or t.get("save_path") or "")
-        source_path = Path(content_path)
-
-        if source_path.is_file():
-            source_path = source_path.parent
-
-        if not source_path.exists():
-            fallback = Path(normalize_source_path((t.get("save_path") or "") + "/" + (t.get("name") or "")))
-            if fallback.exists():
-                source_path = fallback
-            else:
-                continue
-
-        videos = find_videos(source_path)
-        if not videos:
+        source_path, videos = resolve_torrent_source(t)
+        if not source_path or not videos:
             continue
 
         name = t.get("name", source_path.name)
@@ -73,14 +105,16 @@ def qbit_completed_items(settings):
             "hash": t.get("hash", ""),
             "state": t.get("state", ""),
             "ratio": round(float(t.get("ratio", 0)), 2),
+            "tracker": t.get("tracker", ""),
+            "category": t.get("category", ""),
+            "tags": t.get("tags", ""),
+            "size": int(t.get("size", 0)),
         })
 
     return sorted(items, key=lambda x: (x["imported"], x["name"].lower()))
 
+
 def test_qbit(settings):
-    session, url = qbit_session(settings)
-    r = session.get(f"{url}/api/v2/torrents/info", timeout=8)
-    r.raise_for_status()
-    torrents = r.json()
+    torrents = qbit_torrents(settings)
     completed = sum(1 for t in torrents if float(t.get("progress", 0)) >= 1)
     return completed
