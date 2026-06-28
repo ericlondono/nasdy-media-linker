@@ -13,9 +13,16 @@ def normalize_source_path(raw_path: str):
     return p
 
 
+def normalize_qbit_url(raw_url: str) -> str:
+    url = (raw_url or "").strip().rstrip("/")
+    if url and not url.startswith(("http://", "https://")):
+        url = "http://" + url
+    return url
+
+
 def qbit_session(settings):
     s = requests.Session()
-    url = settings.get("qbittorrent_url", "").rstrip("/")
+    url = normalize_qbit_url(settings.get("qbittorrent_url", ""))
     username = settings.get("qbittorrent_username", "")
     password = settings.get("qbittorrent_password", "")
 
@@ -31,18 +38,17 @@ def qbit_session(settings):
     )
 
     if r.status_code not in (200, 204):
-    raise ValueError(f"qBittorrent login failed. HTTP {r.status_code}: {r.text[:80]}")
+        raise ValueError(f"qBittorrent login failed. HTTP {r.status_code}: {r.text[:80]}")
 
-# qBittorrent 5.x may return 204 No Content, so verify auth with a real API call.
-check = s.get(f"{url}/api/v2/app/version", timeout=8)
+    check = s.get(f"{url}/api/v2/app/version", timeout=8)
+    if check.status_code != 200:
+        raise ValueError(
+            f"qBittorrent login could not be verified. "
+            f"Login HTTP {r.status_code}, verify HTTP {check.status_code}: {check.text[:80]}"
+        )
 
-if check.status_code != 200:
-    raise ValueError(
-        f"qBittorrent login could not be verified. "
-        f"Login HTTP {r.status_code}, verify HTTP {check.status_code}: {check.text[:80]}"
-    )
+    return s, url
 
-return s, url
 
 def qbit_torrents(settings):
     session, url = qbit_session(settings)
