@@ -30,11 +30,19 @@ def qbit_session(settings):
         timeout=8,
     )
 
-    if r.status_code != 200 or "Ok." not in r.text:
-        raise ValueError(f"qBittorrent login failed. HTTP {r.status_code}: {r.text[:80]}")
+    if r.status_code not in (200, 204):
+    raise ValueError(f"qBittorrent login failed. HTTP {r.status_code}: {r.text[:80]}")
 
-    return s, url
+# qBittorrent 5.x may return 204 No Content, so verify auth with a real API call.
+check = s.get(f"{url}/api/v2/app/version", timeout=8)
 
+if check.status_code != 200:
+    raise ValueError(
+        f"qBittorrent login could not be verified. "
+        f"Login HTTP {r.status_code}, verify HTTP {check.status_code}: {check.text[:80]}"
+    )
+
+return s, url
 
 def qbit_torrents(settings):
     session, url = qbit_session(settings)
