@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>{{ app_name }} Settings</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<main class="shell narrow">
+  <header class="hero">
+    <div>
+      <h1>Settings</h1>
+      <p>{{ app_name }} {{ version }}</p>
+    </div>
+    <div class="hero-actions">
+      <a class="navlink" href="/">Home</a>
+      <a class="navlink" href="/dev">Dev</a>
+    </div>
+  </header>
+
+  <section class="card">
+    <form method="post" action="/settings" id="settingsForm">
+      <h2>qBittorrent</h2>
+      <label class="checkline"><input type="checkbox" name="qbittorrent_enabled" {% if settings.qbittorrent_enabled %}checked{% endif %}> Enable qBittorrent queue</label>
+
+      <label>qBittorrent URL</label>
+      <input name="qbittorrent_url" id="qbittorrent_url" value="{{ settings.qbittorrent_url }}" placeholder="http://192.168.0.109:8080">
+
+      <label>Username</label>
+      <input name="qbittorrent_username" id="qbittorrent_username" value="{{ settings.qbittorrent_username }}">
+
+      <label>Password</label>
+      <input name="qbittorrent_password" id="qbittorrent_password" type="password" value="{{ settings.qbittorrent_password }}">
+
+      <button type="button" class="secondary" id="testQbit">Test qBittorrent</button>
+      <p id="testResult"></p>
+
+      <h2>TMDb</h2>
+      <label>TMDb API Key</label>
+      <input name="tmdb_api_key" value="{{ settings.tmdb_api_key }}">
+
+      <h2>Jellyfin</h2>
+      <label>Jellyfin URL</label>
+      <input name="jellyfin_url" value="{{ settings.jellyfin_url }}" placeholder="http://192.168.0.109:8096">
+
+      <label>Jellyfin API Key</label>
+      <input name="jellyfin_api_key" value="{{ settings.jellyfin_api_key }}">
+
+      <h2>Developer</h2>
+      <label class="checkline"><input type="checkbox" name="developer_mode" {% if settings.developer_mode %}checked{% endif %}> Developer Mode</label>
+
+      <div class="actions">
+        <button type="submit">Save Settings</button>
+      </div>
+    </form>
+  </section>
+</main>
+<script src="/static/settings.js"></script>
+</body>
+</html>

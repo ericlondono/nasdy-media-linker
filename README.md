@@ -1,30 +1,22 @@
-# NASDY Media Linker v2.0
+# NASDY Media Linker v3.0
 
-A lightweight unRAID app for hard-linking completed downloads into Jellyfin-friendly folders while keeping qBittorrent seeding untouched.
+A lightweight unRAID app that hard-links completed downloads into Jellyfin-friendly folders while preserving qBittorrent seeding.
 
-## v2.0 highlights
+## v3.0
 
-- qBittorrent integration foundation
-- Completed torrent queue when qBittorrent is configured
-- Folder fallback when qBittorrent is not configured
-- Search/filter box
-- Better import database
-- Duplicate import warnings
-- Dry-run table
-- TMDb/Jellyfin foundations remain available
+- Reorganized project structure
+- Hard-link resolver for unRAID cache/disk paths
+- Developer Mode page
+- Link diagnostics
+- qBittorrent settings remain in the web UI
+- Folder mode fallback
+- Import tracking
 
-## Install / Update
-
-Replace the files in:
-
-```bash
-/mnt/user/appdata/nasdy-media-organizer
-```
-
-Then run:
+## Install / update on unRAID
 
 ```bash
 cd /mnt/user/appdata/nasdy-media-organizer
+git pull
 chmod +x install-unraid.sh
 ./install-unraid.sh
 ```
@@ -35,18 +27,13 @@ Open:
 http://NASDY:8088
 ```
 
-## Optional qBittorrent config
+## Important volume
 
-Edit `install-unraid.sh` later and set:
+v3.0 mounts `/mnt` into the container at `/host_mnt` so Media Linker can resolve real unRAID paths like:
 
-```bash
--e QBITTORRENT_URL="http://192.168.0.109:8080" \
--e QBITTORRENT_USERNAME="your_username" \
--e QBITTORRENT_PASSWORD="your_password" \
+```text
+/host_mnt/cache/NASDY/downloads/...
+/host_mnt/disk1/NASDY/media/...
 ```
 
-Then rerun:
-
-```bash
-./install-unraid.sh
-```
+That is what lets it avoid `Invalid cross-device link` issues.
