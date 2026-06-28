@@ -30,7 +30,7 @@
   <section class="layout">
     <aside class="card">
       <div class="card-head">
-        <h2>{{% if qbittorrent_enabled %}Completed Torrents{% else %}Folders{% endif %}}</h2>
+        <h2>{% if qbittorrent_enabled %}Completed Torrents{% else %}Folders{% endif %}</h2>
         <span>{{ items|length }} ready</span>
       </div>
       <input class="search" id="queueSearch" placeholder="Search queue...">
