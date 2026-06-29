@@ -38,7 +38,10 @@
 
       <h2>TMDb</h2>
       <label>TMDb API Key</label>
-      <input name="tmdb_api_key" value="{{ settings.tmdb_api_key }}">
+      <input name="tmdb_api_key" id="tmdb_api_key" value="{{ settings.tmdb_api_key }}" placeholder="Paste your TMDb API key">
+
+      <button type="button" class="secondary" id="testTmdb">Test TMDb</button>
+      <p id="tmdbTestResult"></p>
 
       <h2>Jellyfin</h2>
       <label>Jellyfin URL</label>

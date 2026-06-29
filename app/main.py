@@ -10,8 +10,8 @@ from fastapi.templating import Jinja2Templates
 from app.config import APP_NAME, APP_VERSION
 from app.services.storage import load_settings, save_settings, load_import_db, save_import_db, append_history, read_history
 from app.services.queue import queue_items
-from app.services.linker import build_plan, create_hard_links, diagnostic_for_link
-from app.services.tmdb import tmdb_search
+from app.services.linker import build_plan, create_hard_links, diagnostic_for_link, destination_exists
+from app.services.tmdb import tmdb_search, test_tmdb
 from app.services.jellyfin import jellyfin_refresh
 from app.services.qbittorrent import test_qbit
 from app.services.logger import read_log, log
@@ -19,6 +19,7 @@ from app.services.logger import read_log, log
 app = FastAPI(title=APP_NAME)
 app.mount("/static", StaticFiles(directory="app/static"), name="static")
 templates = Jinja2Templates(directory="app/templates")
+
 
 @app.get("/", response_class=HTMLResponse)
 def index(request: Request):
@@ -38,6 +39,7 @@ def index(request: Request):
         "qbittorrent_enabled": bool(settings.get("qbittorrent_enabled")),
     })
 
+
 @app.get("/settings", response_class=HTMLResponse)
 def settings_page(request: Request):
     return templates.TemplateResponse("settings.html", {
@@ -46,6 +48,7 @@ def settings_page(request: Request):
         "version": APP_VERSION,
         "settings": load_settings(),
     })
+
 
 @app.post("/settings")
 def save_settings_route(
@@ -70,6 +73,7 @@ def save_settings_route(
     })
     return RedirectResponse("/settings?saved=1", status_code=303)
 
+
 @app.post("/api/qbit/test")
 async def api_qbit_test(request: Request):
     data = await request.json()
@@ -81,19 +85,32 @@ async def api_qbit_test(request: Request):
     except Exception as e:
         return JSONResponse({"ok": False, "message": str(e)})
 
+
+@app.post("/api/tmdb/test")
+async def api_tmdb_test(request: Request):
+    data = await request.json()
+    settings = load_settings()
+    settings.update(data)
+    try:
+        test_tmdb(settings)
+        return JSONResponse({"ok": True, "message": "Connected to TMDb."})
+    except Exception as e:
+        return JSONResponse({"ok": False, "message": str(e)})
+
+
 @app.post("/api/preview")
 async def api_preview(request: Request):
     data = await request.json()
     try:
         dest_dir, items = build_plan(
-            data.get("media_type","tv"),
-            data.get("source",""),
-            data.get("title",""),
-            data.get("year",""),
-            data.get("season","01"),
+            data.get("media_type", "tv"),
+            data.get("source", ""),
+            data.get("title", ""),
+            data.get("year", ""),
+            data.get("season", "01"),
         )
         settings = load_settings()
-        meta = tmdb_search(settings, data.get("media_type","tv"), data.get("title",""), data.get("year",""))
+        meta = tmdb_search(settings, data.get("media_type", "tv"), data.get("title", ""), data.get("year", ""))
         db = load_import_db()
         source_key = data.get("source_key") or data.get("source") or ""
         imported = db.get(source_key)
@@ -112,11 +129,12 @@ async def api_preview(request: Request):
                 "src": str(i["src"]),
                 "dst": str(i["dst"]),
                 "new_name": i["new_name"],
-                "exists": Path(i["dst"]).exists()
+                "exists": destination_exists(i)
             } for i in items],
         })
     except Exception as e:
         return JSONResponse({"ok": False, "error": str(e)})
+
 
 @app.post("/organize")
 def organize(
@@ -167,6 +185,7 @@ def organize(
         })
         return RedirectResponse("/", status_code=303)
 
+
 @app.get("/dev", response_class=HTMLResponse)
 def dev_page(request: Request):
     settings = load_settings()
@@ -178,10 +197,12 @@ def dev_page(request: Request):
         "log": read_log(),
     })
 
+
 @app.post("/api/jellyfin/refresh")
 def api_jellyfin_refresh():
     ok, msg = jellyfin_refresh(load_settings())
     return JSONResponse({"ok": ok, "message": msg})
+
 
 @app.get("/health")
 def health():
