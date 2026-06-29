@@ -319,3 +319,10 @@ button.secondary { background: #1f6feb; }
   border-color: #2dbd6e;
 }
 
+
+button.disabled,
+button:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+

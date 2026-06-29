@@ -13,6 +13,18 @@ function getMediaType() {
   return checked ? checked.value : "tv";
 }
 
+function getImportButton() {
+  return document.querySelector('form[action="/organize"] button[type="submit"]');
+}
+
+function setImportButton(text, disabled = false) {
+  const btn = getImportButton();
+  if (!btn) return;
+  btn.textContent = text;
+  btn.disabled = disabled;
+  btn.classList.toggle("disabled", disabled);
+}
+
 function updateSeasonVisibility() {
   const seasonWrap = $("#seasonWrap");
   if (!seasonWrap) return;
@@ -46,6 +58,7 @@ function fillFromCard(card) {
   $("#season").value = card.dataset.season || "01";
 
   setMediaType(card.dataset.type || "tv");
+  setImportButton("Checking...", true);
 
   $("#metadata").innerHTML = `
     <div>
@@ -64,9 +77,10 @@ function renderImportAdvisor(data) {
   if (!metadata) return;
 
   if (data.imported) {
+    setImportButton("Already Imported", true);
     metadata.innerHTML = `
       <div>
-        <h3>?? Already Linked</h3>
+        <h3>Already Linked</h3>
         <p>This item is already in Media Linker import history.</p>
         <p><strong>Destination:</strong><br>${escapeHtml(data.imported.destination || "")}</p>
         <p><strong>Linked:</strong> ${escapeHtml(data.imported.time || "")}</p>
@@ -77,13 +91,20 @@ function renderImportAdvisor(data) {
   }
 
   const match = data.library_match;
+  const mediaType = getMediaType();
 
   if (!match) {
+    if (mediaType === "movie") {
+      setImportButton("Create New Movie", false);
+    } else {
+      setImportButton("Create New TV Folder", false);
+    }
+
     metadata.innerHTML = `
       <div>
-        <h3>?? New Library Folder</h3>
+        <h3>New Library Folder</h3>
         <p>No existing library match was found.</p>
-        <p><strong>Recommendation:</strong> Media Linker will create a new folder using the title, year, and season shown below.</p>
+        <p><strong>Recommendation:</strong> Create a new destination folder.</p>
         <p><strong>Destination:</strong><br>${escapeHtml(data.destination || "")}</p>
       </div>
     `;
@@ -91,13 +112,14 @@ function renderImportAdvisor(data) {
   }
 
   if (match.kind === "movie") {
+    setImportButton("Import into Existing Movie", false);
     metadata.innerHTML = `
       <div>
-        <h3>?? Existing Movie Found</h3>
+        <h3>Existing Movie Found</h3>
         <p><strong>${escapeHtml(match.title)}</strong></p>
         <p>Media Linker found an existing movie folder in your library.</p>
         <p><strong>Videos already there:</strong> ${escapeHtml(match.video_count)}</p>
-        <p><strong>Confidence:</strong> ${escapeHtml(match.confidence)} · Score ${escapeHtml(match.score)}</p>
+        <p><strong>Confidence:</strong> ${escapeHtml(match.confidence)} / Score ${escapeHtml(match.score)}</p>
         <p><strong>Recommendation:</strong> Import into the existing movie folder.</p>
         <p><strong>Path:</strong><br>${escapeHtml(match.path)}</p>
       </div>
@@ -109,14 +131,16 @@ function renderImportAdvisor(data) {
     ? match.existing_episodes.map(e => String(e).padStart(2, "0")).join(", ")
     : "None detected";
 
+  setImportButton(`Import into Season ${match.season}`, false);
+
   metadata.innerHTML = `
     <div>
-      <h3>?? Existing Show Found</h3>
+      <h3>Existing Show Found</h3>
       <p><strong>${escapeHtml(match.title)}</strong></p>
       <p>Media Linker found this show in your TV library.</p>
       <p><strong>Season ${escapeHtml(match.season)}:</strong> ${match.season_exists ? "Exists" : "Not found yet"}</p>
       <p><strong>Episodes already there:</strong> ${escapeHtml(episodes)}</p>
-      <p><strong>Confidence:</strong> ${escapeHtml(match.confidence)} · Score ${escapeHtml(match.score)}</p>
+      <p><strong>Confidence:</strong> ${escapeHtml(match.confidence)} / Score ${escapeHtml(match.score)}</p>
       <p><strong>Recommendation:</strong> Import into the existing show/season folder.</p>
       <p><strong>Path:</strong><br>${escapeHtml(match.season_path || match.path)}</p>
     </div>
@@ -128,6 +152,7 @@ function renderPreview(data) {
   if (!preview) return;
 
   if (!data.ok) {
+    setImportButton("Import Unavailable", true);
     preview.innerHTML = `<div class="empty-preview bad-text">${escapeHtml(data.error || "Preview failed")}</div>`;
     return;
   }
@@ -205,9 +230,6 @@ document.addEventListener("DOMContentLoaded", () => {
 
   const previewBtn = $("#previewBtn");
   if (previewBtn) previewBtn.style.display = "none";
-
-  const importButton = document.querySelector('form[action="/organize"] button[type="submit"]');
-  if (importButton) importButton.textContent = "?? Import";
 
   const first = document.querySelector('.torrent-card[data-imported="false"]')
     || document.querySelector(".torrent-card")
