@@ -14,6 +14,7 @@ from app.services.linker import build_plan, create_hard_links, diagnostic_for_li
 from app.services.tmdb import tmdb_search, test_tmdb
 from app.services.jellyfin import jellyfin_refresh
 from app.services.qbittorrent import test_qbit
+from app.services.library import find_library_match
 from app.services.logger import read_log, log
 
 app = FastAPI(title=APP_NAME)
@@ -102,17 +103,19 @@ async def api_tmdb_test(request: Request):
 async def api_preview(request: Request):
     data = await request.json()
     try:
-        dest_dir, items = build_plan(
-            data.get("media_type", "tv"),
-            data.get("source", ""),
-            data.get("title", ""),
-            data.get("year", ""),
-            data.get("season", "01"),
-        )
+        media_type = data.get("media_type", "tv")
+        source = data.get("source", "")
+        title = data.get("title", "")
+        year = data.get("year", "")
+        season = data.get("season", "01")
+
+        dest_dir, items = build_plan(media_type, source, title, year, season)
         settings = load_settings()
-        meta = tmdb_search(settings, data.get("media_type", "tv"), data.get("title", ""), data.get("year", ""))
+        meta = tmdb_search(settings, media_type, title, year)
+        library_match = find_library_match(media_type, title, year, season)
+
         db = load_import_db()
-        source_key = data.get("source_key") or data.get("source") or ""
+        source_key = data.get("source_key") or source or ""
         imported = db.get(source_key)
 
         diagnostics = []
@@ -123,6 +126,7 @@ async def api_preview(request: Request):
             "ok": True,
             "destination": str(dest_dir),
             "metadata": meta,
+            "library_match": library_match,
             "imported": imported,
             "diagnostics": diagnostics,
             "items": [{
