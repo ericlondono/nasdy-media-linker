@@ -192,26 +192,42 @@ def history_import_keys():
     return keys
 
 
-def imported_from_history(name: str, title: str, year: str, source_path: str, history_keys: set) -> bool:
-    candidates = [
-        name,
-        title,
-        f"{title} {year}".strip(),
-        source_path,
-    ]
+def imported_from_history(name: str, title: str, year: str, source_path: str, history_keys: set, media_type: str = "", season: str = "") -> bool:
+    normalized_source = normalize_match_text(source_path)
+    normalized_title = normalize_match_text(title)
+    normalized_name = normalize_match_text(name)
+    normalized_year_title = normalize_match_text(f"{title} {year}".strip())
 
-    normalized_candidates = [normalize_match_text(c) for c in candidates if c]
+    season_num = str(season or "").zfill(2)
+    season_tokens = {
+        normalize_match_text(f"Season {season_num}"),
+        normalize_match_text(f"Season {int(season_num)}") if season_num.isdigit() else "",
+        normalize_match_text(f"S{season_num}"),
+    }
 
-    for candidate in normalized_candidates:
-        if not candidate:
+    for key in history_keys:
+        if not key:
             continue
 
-        for key in history_keys:
-            if not key:
-                continue
+        if media_type == "tv":
+            title_match = (
+                normalized_title and normalized_title in key
+            ) or (
+                normalized_name and normalized_name in key
+            ) or (
+                normalized_source and normalized_source in key
+            )
 
-            # Match title/year against destination/title history.
-            if candidate in key or key in candidate:
+            season_match = any(token and token in key for token in season_tokens)
+
+            if title_match and season_match:
+                return True
+
+            continue
+
+        candidates = [normalized_source, normalized_year_title, normalized_name, normalized_title]
+        for candidate in candidates:
+            if candidate and (candidate in key or key in candidate):
                 return True
 
     return False
@@ -243,12 +259,16 @@ def qbit_completed_items(settings):
         title = strip_release_words(name)
         year = detect_year(name)
 
+        season = detect_season(name)
+
         imported = key in db or imported_from_history(
             name=name,
             title=title,
             year=year,
             source_path=str(source_path),
             history_keys=history_keys,
+            media_type=media_type,
+            season=season,
         )
 
         items.append({
@@ -260,7 +280,7 @@ def qbit_completed_items(settings):
             "type_label": "TV Show" if media_type == "tv" else "Movie",
             "title": title,
             "year": year,
-            "season": detect_season(name),
+            "season": season,
             "modified": "qBittorrent",
             "source_kind": "torrent",
             "source_key": key,
