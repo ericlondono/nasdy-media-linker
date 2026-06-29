@@ -2,10 +2,6 @@ function $(selector) {
   return document.querySelector(selector);
 }
 
-function selectedCard() {
-  return document.querySelector(".folder.active");
-}
-
 function setMediaType(type) {
   const radio = document.querySelector(`input[name="media_type"][value="${type}"]`);
   if (radio) radio.checked = true;
@@ -23,6 +19,15 @@ function updateSeasonVisibility() {
   seasonWrap.style.display = getMediaType() === "movie" ? "none" : "block";
 }
 
+function escapeHtml(value) {
+  return String(value ?? "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#039;");
+}
+
 function fillFromCard(card) {
   if (!card) return;
 
@@ -36,6 +41,119 @@ function fillFromCard(card) {
   $("#season").value = card.dataset.season || "01";
 
   setMediaType(card.dataset.type || "tv");
+
+  const metadata = $("#metadata");
+  if (metadata) {
+    metadata.classList.remove("hidden");
+    metadata.innerHTML = `
+      <div>
+        <h3>Import Advisor</h3>
+        <p>Select <strong>Preview</strong> to check your existing library and hard-link plan.</p>
+      </div>
+    `;
+  }
+}
+
+function renderImportAdvisor(data) {
+  const metadata = $("#metadata");
+  if (!metadata) return;
+
+  const match = data.library_match;
+
+  if (data.imported) {
+    metadata.classList.remove("hidden");
+    metadata.innerHTML = `
+      <div>
+        <h3>?? Already Linked</h3>
+        <p>This item appears in Media Linker import history.</p>
+        <p><strong>Destination:</strong> ${escapeHtml(data.imported.destination || "")}</p>
+        <p><strong>Linked:</strong> ${escapeHtml(data.imported.time || "")}</p>
+      </div>
+    `;
+    return;
+  }
+
+  if (!match) {
+    metadata.classList.remove("hidden");
+    metadata.innerHTML = `
+      <div>
+        <h3>?? New Library Folder</h3>
+        <p>No existing library match was found.</p>
+        <p><strong>Recommendation:</strong> Review the title/year/season, then import as a new folder.</p>
+      </div>
+    `;
+    return;
+  }
+
+  if (match.kind === "movie") {
+    metadata.classList.remove("hidden");
+    metadata.innerHTML = `
+      <div>
+        <h3>?? Existing Movie Found</h3>
+        <p><strong>${escapeHtml(match.title)}</strong></p>
+        <p><strong>Videos:</strong> ${escapeHtml(match.video_count)}</p>
+        <p><strong>Confidence:</strong> ${escapeHtml(match.confidence)} · Score ${escapeHtml(match.score)}</p>
+        <p><strong>Recommendation:</strong> Import into the existing movie folder.</p>
+        <p><strong>Path:</strong> ${escapeHtml(match.path)}</p>
+      </div>
+    `;
+    return;
+  }
+
+  const episodes = Array.isArray(match.existing_episodes) && match.existing_episodes.length
+    ? match.existing_episodes.map(e => String(e).padStart(2, "0")).join(", ")
+    : "None detected";
+
+  metadata.classList.remove("hidden");
+  metadata.innerHTML = `
+    <div>
+      <h3>?? Existing Show Found</h3>
+      <p><strong>${escapeHtml(match.title)}</strong></p>
+      <p><strong>Season ${escapeHtml(match.season)}:</strong> ${match.season_exists ? "Exists" : "Not found yet"}</p>
+      <p><strong>Existing episodes:</strong> ${escapeHtml(episodes)}</p>
+      <p><strong>Confidence:</strong> ${escapeHtml(match.confidence)} · Score ${escapeHtml(match.score)}</p>
+      <p><strong>Recommendation:</strong> Import into the existing show/season folder.</p>
+      <p><strong>Path:</strong> ${escapeHtml(match.season_path || match.path)}</p>
+    </div>
+  `;
+}
+
+function renderPreview(data) {
+  const preview = $("#preview");
+  if (!preview) return;
+
+  if (!data.ok) {
+    preview.innerHTML = `<div class="empty-preview bad-text">${escapeHtml(data.error || "Preview failed")}</div>`;
+    return;
+  }
+
+  const rows = (data.items || []).map(item => `
+    <tr>
+      <td>${escapeHtml(item.src)}</td>
+      <td>${escapeHtml(item.new_name || item.dst)}</td>
+      <td>${item.exists ? '<span class="exists">Exists</span>' : '<span class="good-text">Ready</span>'}</td>
+    </tr>
+  `).join("");
+
+  preview.innerHTML = `
+    <div class="destination"><strong>Destination:</strong><br>${escapeHtml(data.destination || "")}</div>
+    <table class="preview-table">
+      <thead>
+        <tr>
+          <th>Original</th>
+          <th>New filename</th>
+          <th>Status</th>
+        </tr>
+      </thead>
+      <tbody>${rows}</tbody>
+    </table>
+  `;
+}
+
+function renderDiagnostics(data) {
+  const diag = $("#diagnostics");
+  if (!diag) return;
+  diag.textContent = JSON.stringify(data.diagnostics || [], null, 2);
 }
 
 async function previewSelected() {
@@ -45,8 +163,16 @@ async function previewSelected() {
     media_type: getMediaType(),
     title: $("#title").value,
     year: $("#year").value,
-    season: $("#season").value,
+    season: $("#season").value || "01",
   };
+
+  if (!payload.source) {
+    $("#warning").textContent = "Select a queue item first.";
+    return;
+  }
+
+  $("#warning").textContent = "";
+  $("#preview").innerHTML = '<div class="empty-preview">Checking import plan...</div>';
 
   const response = await fetch("/api/preview", {
     method: "POST",
@@ -56,33 +182,12 @@ async function previewSelected() {
 
   const data = await response.json();
 
-  if (data.library_match) {
-    const metadata = $("#metadata");
-    metadata.classList.remove("hidden");
-
-    let html = `<h3>? Existing Library Match</h3>`;
-
-    if (data.library_match.kind === "movie") {
-      html += `
-        <p><strong>Movie Folder:</strong> ${data.library_match.title}</p>
-        <p><strong>Videos:</strong> ${data.library_match.video_count}</p>
-        <p><strong>Confidence:</strong> ${data.library_match.confidence}</p>
-      `;
-    } else {
-      html += `
-        <p><strong>Show:</strong> ${data.library_match.title}</p>
-        <p><strong>Season:</strong> ${data.library_match.season}</p>
-        <p><strong>Season Exists:</strong> ${data.library_match.season_exists}</p>
-        <p><strong>Episodes:</strong> ${data.library_match.existing_episodes.join(", ")}</p>
-      `;
-    }
-
-    metadata.innerHTML = html;
-  }
+  renderImportAdvisor(data);
+  renderPreview(data);
+  renderDiagnostics(data);
 }
 
 document.addEventListener("DOMContentLoaded", () => {
-
   document.querySelectorAll(".folder").forEach(card => {
     card.addEventListener("click", () => fillFromCard(card));
   });
@@ -91,10 +196,12 @@ document.addEventListener("DOMContentLoaded", () => {
     radio.addEventListener("change", updateSeasonVisibility);
   });
 
-  $("#previewBtn").addEventListener("click", previewSelected);
+  const previewBtn = $("#previewBtn");
+  if (previewBtn) previewBtn.addEventListener("click", previewSelected);
 
   const first = document.querySelector('.torrent-card[data-imported="false"]')
-      || document.querySelector(".torrent-card");
+    || document.querySelector(".torrent-card")
+    || document.querySelector(".folder");
 
   if (first) fillFromCard(first);
 
