@@ -94,27 +94,39 @@
               >
                 <span class="torrent-topline">
                   <span class="torrent-icon">{{ item.icon }}</span>
-                  <span class="folder-title">{{ item.name }}</span>
+                  <span class="torrent-heading">
+                    <span class="folder-title">{{ item.title if item.title else item.name }}</span>
+                    {% if item.year %}
+                      <span class="year-pill">{{ item.year }}</span>
+                    {% endif %}
+                  </span>
                 </span>
 
-                <span class="torrent-meta-row">
+                <span class="release-name">{{ item.name }}</span>
+
+                <span class="torrent-status-row">
                   <span class="status-chip {% if item.imported %}imported{% else %}ready{% endif %}">
                     {% if item.imported %}Imported{% else %}Ready{% endif %}
                   </span>
-                  <span>{{ item.type_label }}</span>
-                  <span>{{ item.video_count }} video{% if item.video_count != 1 %}s{% endif %}</span>
+                  <span class="mini-pill">{{ item.type_label }}</span>
+                  <span class="mini-pill">{{ item.video_count }} video{% if item.video_count != 1 %}s{% endif %}</span>
                 </span>
 
                 {% if qbittorrent_enabled %}
-                  <span class="torrent-details">
-                    {% if item.ratio != "" %}
-                      <span>Ratio {{ item.ratio }}</span>
-                    {% endif %}
-                    {% if item.state %}
-                      <span>{{ item.state }}</span>
-                    {% endif %}
+                  <span class="metric-grid">
+                    <span class="metric">
+                      <span class="metric-label">Ratio</span>
+                      <span class="metric-value">{{ item.ratio }}</span>
+                    </span>
+                    <span class="metric">
+                      <span class="metric-label">State</span>
+                      <span class="metric-value">{{ item.state if item.state else "—" }}</span>
+                    </span>
                     {% if item.category %}
-                      <span>{{ item.category }}</span>
+                      <span class="metric wide">
+                        <span class="metric-label">Category</span>
+                        <span class="metric-value">{{ item.category }}</span>
+                      </span>
                     {% endif %}
                   </span>
                 {% else %}
@@ -261,10 +273,7 @@
         });
       });
 
-      if (search) {
-        search.addEventListener("input", applyFilters);
-      }
-
+      if (search) search.addEventListener("input", applyFilters);
       applyFilters();
     })();
   </script>
