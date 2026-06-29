@@ -11,7 +11,7 @@ docker rm "$CONTAINER_NAME" 2>/dev/null || true
 
 mkdir -p "$APP_DIR/data"
 
-echo "Building NASDY Media Linker v3.0..."
+echo "Building NASDY Media Linker..."
 cd "$APP_DIR"
 docker build -t "$IMAGE_NAME" .
 
@@ -35,4 +35,4 @@ docker run -d \
 echo
 echo "Done. Open: http://NASDY:8088"
 echo
-echo "v3.0 includes Developer Mode and a real hard-link resolver."
+echo "NASDY Media Linker deployment complete."
