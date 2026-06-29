@@ -1,4 +1,4 @@
-from datetime import datetime
+﻿from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -13,6 +13,7 @@ from app.services.queue import queue_items
 from app.services.linker import build_plan, create_hard_links, diagnostic_for_link
 from app.services.tmdb import tmdb_search
 from app.services.jellyfin import jellyfin_refresh
+from app.services.qbittorrent import normalize_source_path
 from app.services.qbittorrent import test_qbit
 from app.services.library import find_library_match
 from app.services.logger import read_log, log
@@ -22,10 +23,40 @@ app.mount("/static", StaticFiles(directory="app/static"), name="static")
 templates = Jinja2Templates(directory="app/templates")
 
 
+def history_counts(history):
+    success = sum(1 for h in history if h.get("status") == "success")
+    error = sum(1 for h in history if h.get("status") == "error" or h.get("type") == "error")
+    imported = success
+    return {
+        "success_count": {"value": success},
+        "error_count": {"value": error},
+        "imported_count": {"value": imported},
+    }
+
+
+def save_import_aliases(db, source_key, source, entry):
+    keys = {
+        source_key or "",
+        source or "",
+        normalize_source_path(source or ""),
+        str(Path(source)) if source else "",
+    }
+
+    for key in keys:
+        key = str(key or "").strip()
+        if key:
+            db[key] = entry
+
+    return db
+
+
 @app.get("/", response_class=HTMLResponse)
 def index(request: Request):
     settings = load_settings()
     items, source_label, queue_error = queue_items(settings)
+    history = read_history()
+    counts = history_counts(history)
+
     return templates.TemplateResponse("index.html", {
         "request": request,
         "app_name": APP_NAME,
@@ -33,11 +64,12 @@ def index(request: Request):
         "items": items,
         "source_label": source_label,
         "queue_error": queue_error,
-        "history": read_history(),
+        "history": history,
         "settings": settings,
         "tmdb_enabled": bool(settings.get("tmdb_api_key")),
         "jellyfin_enabled": bool(settings.get("jellyfin_url") and settings.get("jellyfin_api_key")),
         "qbittorrent_enabled": bool(settings.get("qbittorrent_enabled")),
+        **counts,
     })
 
 
@@ -100,12 +132,23 @@ async def api_preview(request: Request):
 
         dest_dir, items = build_plan(media_type, source, title, year, season)
         settings = load_settings()
-        meta = tmdb_search(settings, media_type, title, year)
+
+        meta = tmdb_search(settings, media_type, title, year) or {}
         library_match = find_library_match(media_type, title, year, season)
 
         db = load_import_db()
         source_key = data.get("source_key") or source or ""
-        imported = db.get(source_key)
+        import_candidates = {
+            source_key,
+            source,
+            normalize_source_path(source),
+            str(Path(source)) if source else "",
+        }
+        imported = None
+        for key in import_candidates:
+            if key and key in db:
+                imported = db.get(key)
+                break
 
         diagnostics = []
         for i in items:
@@ -164,11 +207,14 @@ def organize(
             "jellyfin": jf_msg,
             "status": "success",
             "source": source,
+            "source_key": source_key,
             "diagnostics": diagnostics,
         }
+
         append_history(entry)
+
         db = load_import_db()
-        db[source_key or source] = entry
+        db = save_import_aliases(db, source_key, source, entry)
         save_import_db(db)
 
         return RedirectResponse("/", status_code=303)
@@ -180,6 +226,8 @@ def organize(
             "title": title,
             "error": str(e),
             "status": "error",
+            "source": source,
+            "source_key": source_key,
         })
         return RedirectResponse("/", status_code=303)
 
@@ -209,4 +257,3 @@ def health():
         "name": APP_NAME,
         "version": APP_VERSION,
     }
-
