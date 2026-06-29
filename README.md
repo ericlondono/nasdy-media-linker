@@ -1,39 +1,5 @@
-# NASDY Media Linker v3.0
+# NASDY Media Linker
 
-A lightweight unRAID app that hard-links completed downloads into Jellyfin-friendly folders while preserving qBittorrent seeding.
+NASDY Media Linker is a personal media import manager for qBittorrent, Jellyfin, and unRAID.
 
-## v3.0
-
-- Reorganized project structure
-- Hard-link resolver for unRAID cache/disk paths
-- Developer Mode page
-- Link diagnostics
-- qBittorrent settings remain in the web UI
-- Folder mode fallback
-- Import tracking
-
-## Install / update on unRAID
-
-```bash
-cd /mnt/user/appdata/nasdy-media-organizer
-git pull
-chmod +x install-unraid.sh
-./install-unraid.sh
-```
-
-Open:
-
-```text
-http://NASDY:8088
-```
-
-## Important volume
-
-v3.0 mounts `/mnt` into the container at `/host_mnt` so Media Linker can resolve real unRAID paths like:
-
-```text
-/host_mnt/cache/NASDY/downloads/...
-/host_mnt/disk1/NASDY/media/...
-```
-
-That is what lets it avoid `Invalid cross-device link` issues.
+It helps review completed video torrents, detect existing library matches, and create hard links into Jellyfin-friendly movie and TV folders while qBittorrent keeps seeding.
