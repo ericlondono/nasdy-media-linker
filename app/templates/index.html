@@ -204,11 +204,17 @@
       </section>
 
       <aside class="card">
-        <h2>Recent Links</h2>
+        <h2>Import History</h2>
+        <div class="history-tabs">
+          <button class="history-tab active" type="button" data-history-filter="success">Success</button>
+          <button class="history-tab" type="button" data-history-filter="error">Errors</button>
+          <button class="history-tab" type="button" data-history-filter="all">All</button>
+        </div>
+
         <div class="history">
           {% if history %}
             {% for item in history %}
-              <div class="history-item {% if item.type == 'error' %}bad{% endif %}">
+              <div class="history-item {% if item.type == 'error' %}bad{% endif %}" data-history-type="{% if item.type == 'error' %}error{% else %}success{% endif %}">
                 <strong>
                   {% if item.type == 'tv' %}📺{% elif item.type == 'movie' %}🎬{% else %}⚠️{% endif %}
                   {{ item.title }}
@@ -277,5 +283,29 @@
       applyFilters();
     })();
   </script>
-</body>
+
+<script>
+document.addEventListener("DOMContentLoaded", () => {
+  const tabs = document.querySelectorAll(".history-tab");
+  const items = document.querySelectorAll(".history-item");
+
+  function applyHistoryFilter(filter) {
+    items.forEach(item => {
+      const type = item.dataset.historyType || "success";
+      item.classList.toggle("hidden", !(filter === "all" || filter === type));
+    });
+  }
+
+  tabs.forEach(tab => {
+    tab.addEventListener("click", () => {
+      tabs.forEach(t => t.classList.remove("active"));
+      tab.classList.add("active");
+      applyHistoryFilter(tab.dataset.historyFilter || "success");
+    });
+  });
+
+  applyHistoryFilter("success");
+});
+</script>
+\n</body>
 </html>
