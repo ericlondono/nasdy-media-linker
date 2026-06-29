@@ -10,8 +10,8 @@ from fastapi.templating import Jinja2Templates
 from app.config import APP_NAME, APP_VERSION
 from app.services.storage import load_settings, save_settings, load_import_db, save_import_db, append_history, read_history
 from app.services.queue import queue_items
-from app.services.linker import build_plan, create_hard_links, diagnostic_for_link, destination_exists
-from app.services.tmdb import tmdb_search, test_tmdb
+from app.services.linker import build_plan, create_hard_links, diagnostic_for_link
+from app.services.tmdb import tmdb_search
 from app.services.jellyfin import jellyfin_refresh
 from app.services.qbittorrent import test_qbit
 from app.services.library import find_library_match
@@ -87,18 +87,6 @@ async def api_qbit_test(request: Request):
         return JSONResponse({"ok": False, "message": str(e)})
 
 
-@app.post("/api/tmdb/test")
-async def api_tmdb_test(request: Request):
-    data = await request.json()
-    settings = load_settings()
-    settings.update(data)
-    try:
-        test_tmdb(settings)
-        return JSONResponse({"ok": True, "message": "Connected to TMDb."})
-    except Exception as e:
-        return JSONResponse({"ok": False, "message": str(e)})
-
-
 @app.post("/api/preview")
 async def api_preview(request: Request):
     data = await request.json()
@@ -133,7 +121,7 @@ async def api_preview(request: Request):
                 "src": str(i["src"]),
                 "dst": str(i["dst"]),
                 "new_name": i["new_name"],
-                "exists": destination_exists(i)
+                "exists": Path(i["dst"]).exists()
             } for i in items],
         })
     except Exception as e:
