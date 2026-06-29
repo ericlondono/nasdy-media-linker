@@ -49,12 +49,36 @@
               {% endif %}
             </p>
           </div>
-          <span>{{ items|length }} ready</span>
+          <span>{{ items|length }} total</span>
         </div>
+
+        {% if qbittorrent_enabled %}
+          {% set ready_count = namespace(value=0) %}
+          {% set imported_count = namespace(value=0) %}
+          {% for item in items %}
+            {% if item.imported %}
+              {% set imported_count.value = imported_count.value + 1 %}
+            {% else %}
+              {% set ready_count.value = ready_count.value + 1 %}
+            {% endif %}
+          {% endfor %}
+
+          <div class="queue-tabs" role="tablist" aria-label="Queue filters">
+            <button class="queue-tab active" type="button" data-filter="ready">
+              Ready <span>{{ ready_count.value }}</span>
+            </button>
+            <button class="queue-tab" type="button" data-filter="imported">
+              Imported <span>{{ imported_count.value }}</span>
+            </button>
+            <button class="queue-tab" type="button" data-filter="all">
+              All <span>{{ items|length }}</span>
+            </button>
+          </div>
+        {% endif %}
 
         <input id="queueSearch" class="search" placeholder="Search queue..." autocomplete="off">
 
-        <div class="folder-list">
+        <div class="folder-list" id="queueList">
           {% if items %}
             {% for item in items %}
               <button
@@ -66,6 +90,7 @@
                 data-year="{{ item.year }}"
                 data-season="{{ item.season }}"
                 data-type="{{ item.type }}"
+                data-imported="{% if item.imported %}true{% else %}false{% endif %}"
               >
                 <span class="torrent-topline">
                   <span class="torrent-icon">{{ item.icon }}</span>
@@ -100,6 +125,10 @@
           {% else %}
             <p>No completed video items found.</p>
           {% endif %}
+        </div>
+
+        <div id="queueEmpty" class="queue-empty hidden">
+          No items match this filter.
         </div>
       </aside>
 
@@ -189,5 +218,55 @@
   </main>
 
   <script src="/static/app.js"></script>
+  <script>
+    (function () {
+      const tabs = document.querySelectorAll(".queue-tab");
+      const cards = document.querySelectorAll(".torrent-card");
+      const search = document.querySelector("#queueSearch");
+      const empty = document.querySelector("#queueEmpty");
+      let activeFilter = "ready";
+
+      function cardMatchesFilter(card) {
+        const imported = card.dataset.imported === "true";
+        if (activeFilter === "ready") return !imported;
+        if (activeFilter === "imported") return imported;
+        return true;
+      }
+
+      function cardMatchesSearch(card) {
+        if (!search) return true;
+        const term = search.value.trim().toLowerCase();
+        if (!term) return true;
+        return card.textContent.toLowerCase().includes(term);
+      }
+
+      function applyFilters() {
+        let visibleCount = 0;
+
+        cards.forEach(card => {
+          const visible = cardMatchesFilter(card) && cardMatchesSearch(card);
+          card.classList.toggle("hidden", !visible);
+          if (visible) visibleCount += 1;
+        });
+
+        if (empty) empty.classList.toggle("hidden", visibleCount !== 0);
+      }
+
+      tabs.forEach(tab => {
+        tab.addEventListener("click", () => {
+          tabs.forEach(t => t.classList.remove("active"));
+          tab.classList.add("active");
+          activeFilter = tab.dataset.filter || "ready";
+          applyFilters();
+        });
+      });
+
+      if (search) {
+        search.addEventListener("input", applyFilters);
+      }
+
+      applyFilters();
+    })();
+  </script>
 </body>
 </html>
