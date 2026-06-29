@@ -2,7 +2,7 @@ from pathlib import Path
 import requests
 
 from app.config import DOWNLOADS_ROOT, VIDEO_EXTENSIONS
-from app.services.storage import load_import_db
+from app.services.storage import load_import_db, read_history
 from app.services.utils import guess_type, strip_release_words, detect_year, detect_season
 
 
@@ -20,6 +20,10 @@ def normalize_qbit_url(raw_url: str) -> str:
     if url and not url.startswith(("http://", "https://")):
         url = "http://" + url
     return url
+
+
+def normalize_match_text(value: str) -> str:
+    return "".join(ch.lower() for ch in str(value or "") if ch.isalnum())
 
 
 def qbit_session(settings):
@@ -164,9 +168,59 @@ def resolve_video_source(settings, torrent, video_files):
     return None, []
 
 
+def history_import_keys():
+    """
+    Backfill imported detection for items imported before qBittorrent hash tracking existed.
+    Uses recent link history titles and destinations as fuzzy match keys.
+    """
+    keys = set()
+
+    try:
+        history = read_history()
+    except Exception:
+        return keys
+
+    for item in history:
+        if item.get("type") == "error":
+            continue
+
+        for field in ("title", "destination"):
+            value = item.get(field, "")
+            if value:
+                keys.add(normalize_match_text(value))
+
+    return keys
+
+
+def imported_from_history(name: str, title: str, year: str, source_path: str, history_keys: set) -> bool:
+    candidates = [
+        name,
+        title,
+        f"{title} {year}".strip(),
+        source_path,
+    ]
+
+    normalized_candidates = [normalize_match_text(c) for c in candidates if c]
+
+    for candidate in normalized_candidates:
+        if not candidate:
+            continue
+
+        for key in history_keys:
+            if not key:
+                continue
+
+            # Match title/year against destination/title history.
+            if candidate in key or key in candidate:
+                return True
+
+    return False
+
+
 def qbit_completed_items(settings):
     torrents = qbit_torrents(settings)
     db = load_import_db()
+    history_keys = history_import_keys()
     items = []
 
     for torrent in torrents:
@@ -186,6 +240,16 @@ def qbit_completed_items(settings):
         name = torrent.get("name", source_path.name)
         media_type = guess_type(name, len(videos))
         key = torrent.get("hash") or str(source_path)
+        title = strip_release_words(name)
+        year = detect_year(name)
+
+        imported = key in db or imported_from_history(
+            name=name,
+            title=title,
+            year=year,
+            source_path=str(source_path),
+            history_keys=history_keys,
+        )
 
         items.append({
             "name": name,
@@ -194,13 +258,13 @@ def qbit_completed_items(settings):
             "type": media_type,
             "icon": "📺" if media_type == "tv" else "🎬",
             "type_label": "TV Show" if media_type == "tv" else "Movie",
-            "title": strip_release_words(name),
-            "year": detect_year(name),
+            "title": title,
+            "year": year,
             "season": detect_season(name),
             "modified": "qBittorrent",
             "source_kind": "torrent",
             "source_key": key,
-            "imported": key in db,
+            "imported": imported,
             "hash": torrent.get("hash", ""),
             "state": torrent.get("state", ""),
             "ratio": round(float(torrent.get("ratio", 0)), 2),
