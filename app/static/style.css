@@ -38,46 +38,91 @@ p { color: #b8bfcc; }
 .card-head span { color: #aeb6c5; font-weight: 800; white-space: nowrap; }
 .search { margin: 0 0 12px; }
 .folder-list { display: grid; gap: 10px; max-height: 68vh; overflow: auto; padding-right: 4px; }
+
 .folder {
   text-align: left;
-  padding: 13px 14px;
+  padding: 0;
   border: 1px solid #343a49;
   background: #11141b;
   color: #f5f7fb;
-  border-radius: 12px;
+  border-radius: 14px;
   cursor: pointer;
+  overflow: hidden;
 }
 .folder:hover, .folder.active { border-color: #2dbd6e; background: #142018; }
 .folder.imported { opacity: .58; }
-.folder-title { display: block; font-weight: 900; margin-bottom: 0; line-height: 1.22; overflow-wrap: anywhere; }
-.folder-meta { display: block; color: #aeb6c5; font-size: 13px; }
-.torrent-card { display: grid; gap: 8px; }
-.torrent-topline { display: grid; grid-template-columns: 22px 1fr; gap: 6px; align-items: start; }
-.torrent-icon { line-height: 1.2; }
-.torrent-meta-row, .torrent-details {
-  display: flex;
+
+/* Torrent card polish */
+.torrent-card {
+  display: block;
+  padding: 14px;
+}
+.torrent-topline {
+  display: grid;
+  grid-template-columns: 24px minmax(0, 1fr);
+  gap: 9px;
+  align-items: start;
+  margin-bottom: 11px;
+}
+.torrent-icon {
+  width: 24px;
+  height: 24px;
+  display: grid;
+  place-items: center;
+  border-radius: 8px;
+  background: #202634;
+  font-size: 14px;
+  line-height: 1;
+}
+.folder-title {
+  display: block;
+  font-weight: 900;
+  line-height: 1.25;
+  overflow-wrap: anywhere;
+}
+.torrent-meta-row {
+  display: grid;
+  grid-template-columns: auto 1fr;
   gap: 8px;
-  flex-wrap: wrap;
   align-items: center;
-  color: #aeb6c5;
+  margin-left: 33px;
+  margin-bottom: 9px;
   font-size: 12px;
-  font-weight: 750;
+  color: #b7c0d1;
+}
+.torrent-meta-row span:not(.status-chip) {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.torrent-details {
+  display: flex;
+  gap: 7px;
+  flex-wrap: wrap;
+  margin-left: 33px;
 }
 .torrent-details span {
-  background: #0e1118;
+  background: #0c1119;
   border: 1px solid #2b303d;
   color: #aeb6c5;
   border-radius: 999px;
-  padding: 4px 7px;
+  padding: 4px 8px;
+  font-size: 11px;
+  font-weight: 800;
+  line-height: 1.1;
 }
 .status-chip {
   border-radius: 999px;
-  padding: 4px 8px;
-  font-weight: 900;
+  padding: 4px 9px;
+  font-size: 11px;
+  font-weight: 950;
   border: 1px solid transparent;
+  text-transform: uppercase;
+  letter-spacing: .02em;
 }
 .status-chip.ready { background: #12351e; color: #85f0a3; border-color: #2dbd6e; }
 .status-chip.imported { background: #1b2b4a; color: #9db3ff; border-color: #375dae; }
+.folder-meta { display: block; color: #aeb6c5; font-size: 13px; }
+
 label { display: block; margin-top: 14px; margin-bottom: 7px; font-weight: 750; }
 input {
   width: 100%;
