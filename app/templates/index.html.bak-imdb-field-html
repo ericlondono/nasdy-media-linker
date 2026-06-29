@@ -171,10 +171,6 @@
               <label for="year">Year</label>
               <input id="year" name="year" placeholder="optional" autocomplete="off">
             </div>
-        <div>
-            <label for="imdb_id">IMDb ID</label>
-            <input id="imdb_id" name="imdb_id" placeholder="optional, e.g. tt13056008" autocomplete="off">
-        </div>
             <div id="seasonWrap">
               <label for="season">Season</label>
               <input id="season" name="season" value="01" autocomplete="off">
@@ -313,6 +309,4 @@ document.addEventListener("DOMContentLoaded", () => {
 </script>
 \n</body>
 </html>
-
-
 

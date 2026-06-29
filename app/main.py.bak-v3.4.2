@@ -95,7 +95,6 @@ async def api_preview(request: Request):
         source = data.get("source", "")
         title = data.get("title", "")
         year = data.get("year", "")
-        imdb_id = data.get("imdb_id", "").strip()
         season = data.get("season", "01")
 
         dest_dir, items = build_plan(media_type, source, title, year, season)
@@ -114,10 +113,7 @@ async def api_preview(request: Request):
         return JSONResponse({
             "ok": True,
             "destination": str(dest_dir),
-            "metadata": {
-                **meta,
-                "imdb_id": imdb_id,
-            },
+            "metadata": meta,
             "library_match": library_match,
             "imported": imported,
             "diagnostics": diagnostics,
@@ -139,7 +135,6 @@ def organize(
     source_key: str = Form(""),
     title: str = Form(...),
     year: str = Form(""),
-    imdb_id: str = Form(""),
     season: str = Form("01"),
     refresh_jellyfin: Optional[str] = Form(None),
 ):
@@ -157,7 +152,6 @@ def organize(
             "type": media_type,
             "title": title,
             "year": year,
-            "imdb_id": imdb_id.strip(),
             "season": season if media_type == "tv" else "",
             "count": len(created),
             "destination": str(dest_dir),
@@ -209,4 +203,3 @@ def health():
         "name": APP_NAME,
         "version": APP_VERSION,
     }
-
