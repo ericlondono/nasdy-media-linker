@@ -263,3 +263,31 @@ button.secondary { background: #1f6feb; }
 .good-text { color:#85f0a3; font-weight:800; }
 .bad-text { color:#ff7373; font-weight:800; }
 @media (max-width: 1150px) { .layout { grid-template-columns: 1fr; } }
+
+.history-tabs {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 8px;
+  margin: 12px 0;
+}
+
+.history-tab {
+  padding: 9px 10px;
+  border: 1px solid #343a49;
+  background: #10141d;
+  color: #cfd6e3;
+  border-radius: 12px;
+  font-weight: 900;
+  cursor: pointer;
+}
+
+.history-tab.active {
+  border-color: #2dbd6e;
+  background: #12351e;
+  color: #85f0a3;
+}
+
+.history-item.success {
+  border-color: #2dbd6e;
+}
+
