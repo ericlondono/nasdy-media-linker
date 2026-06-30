@@ -25,32 +25,6 @@ function setImportButton(text, disabled = false) {
   btn.classList.toggle("disabled", disabled);
 }
 
-function setManualButtons(imported = false) {
-  const markBtn = $("#markImportedBtn");
-  const unmarkBtn = $("#unmarkImportedBtn");
-  if (markBtn) markBtn.classList.toggle("hidden", imported);
-  if (unmarkBtn) unmarkBtn.classList.toggle("hidden", !imported);
-}
-
-function setActionMessage(message, isError = false) {
-  const warning = $("#warning");
-  if (!warning) return;
-  warning.textContent = message || "";
-  warning.classList.toggle("bad-text", !!isError);
-}
-
-function selectedPayload() {
-  return {
-    source: $("#source")?.value || "",
-    source_key: $("#sourceKey")?.value || "",
-    media_type: getMediaType(),
-    title: $("#title")?.value || "",
-    year: $("#year")?.value || "",
-    imdb_id: $("#imdb_id")?.value || "",
-    season: $("#season")?.value || "01",
-  };
-}
-
 function updateSeasonVisibility() {
   const seasonWrap = $("#seasonWrap");
   if (!seasonWrap) return;
@@ -82,10 +56,6 @@ function fillFromCard(card) {
   $("#title").value = card.dataset.title || "";
   $("#year").value = card.dataset.year || "";
   $("#season").value = card.dataset.season || "01";
-  const imdbInput = $("#imdb_id");
-  if (imdbInput) imdbInput.value = "";
-  setActionMessage("");
-  setManualButtons(card.dataset.imported === "true");
 
   setMediaType(card.dataset.type || "tv");
   setImportButton("Checking...", true);
@@ -107,27 +77,18 @@ function renderImportAdvisor(data) {
   if (!metadata) return;
 
   if (data.imported) {
-    const importType = data.imported.import_type || "linked";
-    const heading = importType === "manual" ? "Manually Marked Imported" : "Previously Hard Linked";
-    const verb = importType === "manual" ? "Marked" : "Linked";
-
     setImportButton("Already Imported", true);
-    setManualButtons(true);
-
     metadata.innerHTML = `
       <div>
-        <h3>${escapeHtml(heading)}</h3>
-        <p>This item is already recorded in Media Linker import tracking.</p>
+        <h3>Already Linked</h3>
+        <p>This item is already in Media Linker import history.</p>
         <p><strong>Destination:</strong><br>${escapeHtml(data.imported.destination || "")}</p>
-        <p><strong>${escapeHtml(verb)}:</strong> ${escapeHtml(data.imported.time || "")}</p>
-        <p><strong>Import Type:</strong> ${escapeHtml(importType)}</p>
+        <p><strong>Linked:</strong> ${escapeHtml(data.imported.time || "")}</p>
         <p><strong>Recommendation:</strong> No action needed.</p>
       </div>
     `;
     return;
   }
-
-  setManualButtons(false);
 
   const match = data.library_match;
   const mediaType = getMediaType();
@@ -226,7 +187,14 @@ function renderDiagnostics(data) {
 }
 
 async function previewSelected() {
-  const payload = selectedPayload();
+  const payload = {
+    source: $("#source")?.value || "",
+    source_key: $("#sourceKey")?.value || "",
+    media_type: getMediaType(),
+    title: $("#title")?.value || "",
+    year: $("#year")?.value || "",
+    season: $("#season")?.value || "01",
+  };
 
   if (!payload.source) return;
 
@@ -243,69 +211,6 @@ async function previewSelected() {
   renderDiagnostics(data);
 }
 
-async function postJson(url, payload) {
-  const response = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload)
-  });
-  return await response.json();
-}
-
-async function markSelectedImported() {
-  const payload = selectedPayload();
-  if (!payload.source) {
-    setActionMessage("Select a queue item first.", true);
-    return;
-  }
-
-  const btn = $("#markImportedBtn");
-  if (btn) {
-    btn.disabled = true;
-    btn.textContent = "Marking...";
-  }
-
-  const data = await postJson("/api/imports/mark", payload);
-  if (!data.ok) {
-    setActionMessage(data.error || "Could not mark this item imported.", true);
-    if (btn) {
-      btn.disabled = false;
-      btn.textContent = "✓ Mark Imported";
-    }
-    return;
-  }
-
-  setActionMessage("Marked imported. Refreshing queue...");
-  window.location.reload();
-}
-
-async function unmarkSelectedImported() {
-  const payload = selectedPayload();
-  if (!payload.source) {
-    setActionMessage("Select a queue item first.", true);
-    return;
-  }
-
-  const btn = $("#unmarkImportedBtn");
-  if (btn) {
-    btn.disabled = true;
-    btn.textContent = "Unmarking...";
-  }
-
-  const data = await postJson("/api/imports/unmark", payload);
-  if (!data.ok) {
-    setActionMessage(data.error || "Could not unmark this item.", true);
-    if (btn) {
-      btn.disabled = false;
-      btn.textContent = "Unmark Imported";
-    }
-    return;
-  }
-
-  setActionMessage("Import mark removed. Refreshing queue...");
-  window.location.reload();
-}
-
 document.addEventListener("DOMContentLoaded", () => {
   document.querySelectorAll(".folder").forEach(card => {
     card.addEventListener("click", () => fillFromCard(card));
@@ -318,19 +223,13 @@ document.addEventListener("DOMContentLoaded", () => {
     });
   });
 
-  ["#title", "#year", "#season", "#imdb_id"].forEach(selector => {
+  ["#title", "#year", "#season"].forEach(selector => {
     const el = $(selector);
     if (el) el.addEventListener("input", schedulePreview);
   });
 
   const previewBtn = $("#previewBtn");
   if (previewBtn) previewBtn.style.display = "none";
-
-  const markBtn = $("#markImportedBtn");
-  if (markBtn) markBtn.addEventListener("click", markSelectedImported);
-
-  const unmarkBtn = $("#unmarkImportedBtn");
-  if (unmarkBtn) unmarkBtn.addEventListener("click", unmarkSelectedImported);
 
   const first = document.querySelector('.torrent-card[data-imported="false"]')
     || document.querySelector(".torrent-card")

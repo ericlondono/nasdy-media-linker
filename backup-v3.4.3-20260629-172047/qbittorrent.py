@@ -9,7 +9,7 @@ from app.services.utils import guess_type, strip_release_words, detect_year, det
 def normalize_source_path(raw_path: str) -> str:
     if not raw_path:
         return ""
-    p = str(raw_path).replace("\\", "/")
+    p = raw_path.replace("\\", "/")
     p = p.replace("/mnt/user/NASDY/downloads", "/downloads")
     p = p.replace("/mnt/user/downloads", "/downloads")
     return p.rstrip("/")
@@ -24,33 +24,6 @@ def normalize_qbit_url(raw_url: str) -> str:
 
 def normalize_match_text(value: str) -> str:
     return "".join(ch.lower() for ch in str(value or "") if ch.isalnum())
-
-
-def import_db_keys(db):
-    keys = set()
-    for key, entry in (db or {}).items():
-        if key:
-            keys.add(str(key))
-            keys.add(normalize_source_path(str(key)))
-        if isinstance(entry, dict):
-            for field in ("source", "source_key", "hash", "destination"):
-                value = entry.get(field)
-                if value:
-                    keys.add(str(value))
-                    keys.add(normalize_source_path(str(value)))
-    return {k for k in keys if k}
-
-
-def imported_from_db(db, candidates):
-    keys = import_db_keys(db)
-    for candidate in candidates:
-        if not candidate:
-            continue
-        c = str(candidate)
-        n = normalize_source_path(c)
-        if c in keys or n in keys:
-            return True
-    return False
 
 
 def qbit_session(settings):
@@ -138,6 +111,12 @@ def find_common_root(paths):
 
 
 def resolve_video_source(settings, torrent, video_files):
+    """
+    Important: never scan the whole downloads folder.
+
+    We use qBittorrent's file list to determine the real source location.
+    Non-video torrents return no video_files and are skipped entirely.
+    """
     save_path = normalize_source_path(torrent.get("save_path") or "")
     content_path = normalize_source_path(torrent.get("content_path") or "")
     name = torrent.get("name") or ""
@@ -190,10 +169,14 @@ def resolve_video_source(settings, torrent, video_files):
 
 
 def history_import_keys():
+    """
+    Backfill imported detection for items imported before qBittorrent hash tracking existed.
+    Uses recent link history titles and destinations as fuzzy match keys.
+    """
     keys = set()
 
     try:
-        history = read_history(limit=500)
+        history = read_history()
     except Exception:
         return keys
 
@@ -201,11 +184,10 @@ def history_import_keys():
         if item.get("type") == "error":
             continue
 
-        for field in ("title", "destination", "source", "source_key", "hash"):
+        for field in ("title", "destination"):
             value = item.get(field, "")
             if value:
                 keys.add(normalize_match_text(value))
-                keys.add(normalize_match_text(normalize_source_path(value)))
 
     return keys
 
@@ -263,6 +245,7 @@ def qbit_completed_items(settings):
 
         video_files = completed_video_files(settings, torrent)
 
+        # This is the main fix: no completed video files means no queue item.
         if not video_files:
             continue
 
@@ -272,23 +255,13 @@ def qbit_completed_items(settings):
 
         name = torrent.get("name", source_path.name)
         media_type = guess_type(name, len(videos))
-        torrent_hash = torrent.get("hash", "")
-        key = torrent_hash or str(source_path)
+        key = torrent.get("hash") or str(source_path)
         title = strip_release_words(name)
         year = detect_year(name)
+
         season = detect_season(name)
 
-        import_candidates = {
-            key,
-            torrent_hash,
-            str(source_path),
-            normalize_source_path(str(source_path)),
-            normalize_source_path(torrent.get("content_path") or ""),
-            normalize_source_path(torrent.get("save_path") or ""),
-            name,
-        }
-
-        imported = imported_from_db(db, import_candidates) or imported_from_history(
+        imported = key in db or imported_from_history(
             name=name,
             title=title,
             year=year,
@@ -312,7 +285,7 @@ def qbit_completed_items(settings):
             "source_kind": "torrent",
             "source_key": key,
             "imported": imported,
-            "hash": torrent_hash,
+            "hash": torrent.get("hash", ""),
             "state": torrent.get("state", ""),
             "ratio": round(float(torrent.get("ratio", 0)), 2),
             "tracker": torrent.get("tracker", ""),

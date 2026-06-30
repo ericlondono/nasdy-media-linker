@@ -2,7 +2,7 @@
 from pathlib import Path
 
 APP_NAME = "NASDY Media Linker"
-APP_VERSION = "v3.4.4"
+APP_VERSION = "3.4.3"
 
 DOWNLOADS_ROOT = Path(os.environ.get("DOWNLOADS_ROOT", "/downloads"))
 MOVIES_ROOT = Path(os.environ.get("MOVIES_ROOT", "/media/Movies"))
@@ -34,6 +34,5 @@ HISTORY_FILE = DATA_ROOT / "history.jsonl"
 IMPORT_DB_FILE = DATA_ROOT / "imports.json"
 SETTINGS_FILE = DATA_ROOT / "settings.json"
 LOG_FILE = DATA_ROOT / "media-linker.log"
-
 
 

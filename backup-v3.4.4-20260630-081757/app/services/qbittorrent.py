@@ -1,4 +1,4 @@
-from pathlib import Path
+﻿from pathlib import Path
 import requests
 
 from app.config import DOWNLOADS_ROOT, VIDEO_EXTENSIONS

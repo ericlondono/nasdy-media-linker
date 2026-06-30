@@ -1,4 +1,4 @@
-from datetime import datetime
+﻿from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -34,64 +34,20 @@ def history_counts(history):
     }
 
 
-def import_alias_keys(source_key, source):
+def save_import_aliases(db, source_key, source, entry):
     keys = {
         source_key or "",
         source or "",
         normalize_source_path(source or ""),
         str(Path(source)) if source else "",
     }
-    return {str(key or "").strip() for key in keys if str(key or "").strip()}
 
-
-def save_import_aliases(db, source_key, source, entry):
-    for key in import_alias_keys(source_key, source):
-        db[key] = entry
-    return db
-
-
-def remove_import_aliases(db, source_key, source):
-    targets = import_alias_keys(source_key, source)
-    normalized_targets = {normalize_source_path(k) for k in targets if k}
-
-    for key in list(db.keys()):
-        key_norm = normalize_source_path(key)
-        entry = db.get(key) or {}
-        entry_source = str(entry.get("source", "")) if isinstance(entry, dict) else ""
-        entry_source_key = str(entry.get("source_key", "")) if isinstance(entry, dict) else ""
-        entry_values = {
-            entry_source,
-            entry_source_key,
-            normalize_source_path(entry_source),
-            normalize_source_path(entry_source_key),
-        }
-
-        if key in targets or key_norm in normalized_targets or entry_values.intersection(targets) or entry_values.intersection(normalized_targets):
-            db.pop(key, None)
+    for key in keys:
+        key = str(key or "").strip()
+        if key:
+            db[key] = entry
 
     return db
-
-
-def find_import_record(db, source_key, source):
-    candidates = import_alias_keys(source_key, source)
-    for key in candidates:
-        if key in db:
-            return db.get(key)
-
-    normalized_candidates = {normalize_source_path(k) for k in candidates}
-    for key, entry in (db or {}).items():
-        if normalize_source_path(key) in normalized_candidates:
-            return entry
-        if isinstance(entry, dict):
-            entry_source = str(entry.get("source", ""))
-            entry_source_key = str(entry.get("source_key", ""))
-            if entry_source in candidates or entry_source_key in candidates:
-                return entry
-            if normalize_source_path(entry_source) in normalized_candidates:
-                return entry
-            if normalize_source_path(entry_source_key) in normalized_candidates:
-                return entry
-    return None
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -182,7 +138,17 @@ async def api_preview(request: Request):
 
         db = load_import_db()
         source_key = data.get("source_key") or source or ""
-        imported = find_import_record(db, source_key, source)
+        import_candidates = {
+            source_key,
+            source,
+            normalize_source_path(source),
+            str(Path(source)) if source else "",
+        }
+        imported = None
+        for key in import_candidates:
+            if key and key in db:
+                imported = db.get(key)
+                break
 
         diagnostics = []
         for i in items:
@@ -206,80 +172,6 @@ async def api_preview(request: Request):
             } for i in items],
         })
     except Exception as e:
-        return JSONResponse({"ok": False, "error": str(e)})
-
-
-@app.post("/api/imports/mark")
-async def api_imports_mark(request: Request):
-    data = await request.json()
-    try:
-        media_type = data.get("media_type", "tv")
-        source = data.get("source", "")
-        source_key = data.get("source_key") or source or ""
-        title = data.get("title", "")
-        year = data.get("year", "")
-        imdb_id = data.get("imdb_id", "").strip()
-        season = data.get("season", "01")
-
-        if not source:
-            return JSONResponse({"ok": False, "error": "No source item selected."})
-        if not title:
-            return JSONResponse({"ok": False, "error": "Title is required before marking imported."})
-
-        destination = ""
-        try:
-            dest_dir, _ = build_plan(media_type, source, title, year, season)
-            destination = str(dest_dir)
-        except Exception as plan_error:
-            log(f"WARN manual mark could not build destination preview: {plan_error}")
-
-        entry = {
-            "time": datetime.now().strftime("%Y-%m-%d %H:%M"),
-            "type": media_type,
-            "title": title,
-            "year": year,
-            "imdb_id": imdb_id,
-            "season": season if media_type == "tv" else "",
-            "count": 0,
-            "destination": destination,
-            "jellyfin": "",
-            "status": "success",
-            "import_type": "manual",
-            "source": source,
-            "source_key": source_key,
-            "diagnostics": [],
-        }
-
-        db = load_import_db()
-        db = save_import_aliases(db, source_key, source, entry)
-        save_import_db(db)
-
-        log(f"Manual import mark: {title} ({year}) source={source} source_key={source_key}")
-        return JSONResponse({"ok": True, "entry": entry})
-    except Exception as e:
-        log(f"ERROR manual import mark: {e}")
-        return JSONResponse({"ok": False, "error": str(e)})
-
-
-@app.post("/api/imports/unmark")
-async def api_imports_unmark(request: Request):
-    data = await request.json()
-    try:
-        source = data.get("source", "")
-        source_key = data.get("source_key") or source or ""
-        if not source and not source_key:
-            return JSONResponse({"ok": False, "error": "No import record selected."})
-
-        db = load_import_db()
-        before = len(db)
-        db = remove_import_aliases(db, source_key, source)
-        removed = before - len(db)
-        save_import_db(db)
-
-        log(f"Manual import unmark: removed {removed} import alias(es) source={source} source_key={source_key}")
-        return JSONResponse({"ok": True, "removed": removed})
-    except Exception as e:
-        log(f"ERROR manual import unmark: {e}")
         return JSONResponse({"ok": False, "error": str(e)})
 
 
@@ -314,7 +206,6 @@ def organize(
             "destination": str(dest_dir),
             "jellyfin": jf_msg,
             "status": "success",
-            "import_type": "linked",
             "source": source,
             "source_key": source_key,
             "diagnostics": diagnostics,
