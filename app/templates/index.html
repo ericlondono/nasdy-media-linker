@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{{ app_name }} {{ version }}</title>
-  <link rel="stylesheet" href="/static/style.css">
+  <link rel="stylesheet" href="/static/style.css?v={{ version }}-cards-final">
 </head>
 <body>
   <main class="shell">
@@ -78,6 +78,16 @@
 
         <input id="queueSearch" class="search" placeholder="Search queue..." autocomplete="off">
 
+        <div class="bulk-toolbar">
+          <label class="bulk-select-all">
+            <input type="checkbox" id="selectAllReady">
+            <span>Select visible</span>
+          </label>
+          <span id="selectedCount" class="selected-count">0 selected</span>
+          <button id="bulkMarkImportedBtn" class="secondary small" type="button" disabled>Mark Selected Imported</button>
+          <button id="clearSelectionBtn" class="small ghost" type="button" disabled>Clear</button>
+        </div>
+
         <div class="folder-list" id="queueList">
           {% if items %}
             {% for item in items %}
@@ -92,6 +102,20 @@
                 data-type="{{ item.type }}"
                 data-imported="{% if item.imported %}true{% else %}false{% endif %}"
               >
+                <span class="select-box-wrap" aria-hidden="true">
+                  <input
+                    class="queue-select"
+                    type="checkbox"
+                    tabindex="-1"
+                    data-source="{{ item.path }}"
+                    data-source-key="{{ item.source_key if item.source_key else item.path }}"
+                    data-title="{{ item.title }}"
+                    data-year="{{ item.year }}"
+                    data-season="{{ item.season }}"
+                    data-type="{{ item.type }}"
+                    data-imported="{% if item.imported %}true{% else %}false{% endif %}"
+                  >
+                </span>
                 <span class="torrent-topline">
                   <span class="torrent-icon">{{ item.icon }}</span>
                   <span class="torrent-heading">
@@ -120,7 +144,7 @@
                     </span>
                     <span class="metric">
                       <span class="metric-label">State</span>
-                      <span class="metric-value">{{ item.state if item.state else "—" }}</span>
+                      <span class="metric-value">{{ item.state if item.state else "ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â" }}</span>
                     </span>
                     {% if item.category %}
                       <span class="metric wide">
@@ -155,11 +179,11 @@
           <div class="segmented">
             <label>
               <input type="radio" name="media_type" value="tv" checked>
-              <span>📺 TV Show</span>
+              <span>TV Show</span>
             </label>
             <label>
               <input type="radio" name="media_type" value="movie">
-              <span>🎬 Movie</span>
+              <span>Movie</span>
             </label>
           </div>
 
@@ -193,7 +217,7 @@
           <div class="actions">
             <button id="previewBtn" class="secondary" type="button">Preview</button>
             <button type="submit">Create Hard Links</button>
-            <button id="markImportedBtn" class="secondary" type="button">✓ Mark Imported</button>
+            <button id="markImportedBtn" class="secondary" type="button">Mark Imported</button>
             {% if settings.developer_mode %}
               <button id="unmarkImportedBtn" class="danger hidden" type="button">Unmark Imported</button>
             {% endif %}
@@ -224,14 +248,14 @@
             {% for item in history %}
               <div class="history-item {% if item.type == 'error' %}bad{% endif %}" data-history-type="{% if item.type == 'error' %}error{% else %}success{% endif %}">
                 <strong>
-                  {% if item.type == 'tv' %}📺{% elif item.type == 'movie' %}🎬{% else %}⚠️{% endif %}
+                  {% if item.type == 'tv' %}ÃƒÂ°Ã…Â¸Ã¢â‚¬Å“Ã‚Âº{% elif item.type == 'movie' %}ÃƒÂ°Ã…Â¸Ã…Â½Ã‚Â¬{% else %}ÃƒÂ¢Ã…Â¡Ã‚Â ÃƒÂ¯Ã‚Â¸Ã‚Â{% endif %}
                   {{ item.title }}
                 </strong>
                 <span>{{ item.time }}</span>
                 {% if item.type == 'error' %}
                   <small>{{ item.error }}</small>
                 {% else %}
-                  <small>{{ item.count }} link(s) → {{ item.destination }}</small>
+                  <small>{{ item.count }} link(s) ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ {{ item.destination }}</small>
                 {% endif %}
               </div>
             {% endfor %}
@@ -243,7 +267,7 @@
     </section>
   </main>
 
-  <script src="/static/app.js"></script>
+  <script src="/static/app.js?v={{ version }}"></script>
   <script>
     (function () {
       const tabs = document.querySelectorAll(".queue-tab");
@@ -276,6 +300,7 @@
         });
 
         if (empty) empty.classList.toggle("hidden", visibleCount !== 0);
+        document.dispatchEvent(new CustomEvent("queueFiltersChanged"));
       }
 
       tabs.forEach(tab => {
@@ -317,6 +342,3 @@ document.addEventListener("DOMContentLoaded", () => {
 </script>
 \n</body>
 </html>
-
-
-

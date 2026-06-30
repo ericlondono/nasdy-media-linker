@@ -1,4 +1,4 @@
-from datetime import datetime
+﻿from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -258,6 +258,73 @@ async def api_imports_mark(request: Request):
         return JSONResponse({"ok": True, "entry": entry})
     except Exception as e:
         log(f"ERROR manual import mark: {e}")
+        return JSONResponse({"ok": False, "error": str(e)})
+
+
+@app.post("/api/imports/mark-bulk")
+async def api_imports_mark_bulk(request: Request):
+    data = await request.json()
+    try:
+        raw_items = data.get("items", []) if isinstance(data, dict) else []
+        if not isinstance(raw_items, list) or not raw_items:
+            return JSONResponse({"ok": False, "error": "No queue items selected."})
+
+        db = load_import_db()
+        marked = []
+        errors = []
+
+        for index, item in enumerate(raw_items, start=1):
+            if not isinstance(item, dict):
+                errors.append({"index": index, "error": "Invalid selected item."})
+                continue
+
+            media_type = item.get("media_type", "tv")
+            source = item.get("source", "")
+            source_key = item.get("source_key") or source or ""
+            title = item.get("title", "")
+            year = item.get("year", "")
+            imdb_id = item.get("imdb_id", "").strip()
+            season = item.get("season", "01")
+
+            if not source:
+                errors.append({"index": index, "title": title, "error": "No source item selected."})
+                continue
+            if not title:
+                errors.append({"index": index, "source": source, "error": "Title is required before marking imported."})
+                continue
+
+            destination = ""
+            try:
+                dest_dir, _ = build_plan(media_type, source, title, year, season)
+                destination = str(dest_dir)
+            except Exception as plan_error:
+                log(f"WARN bulk manual mark could not build destination preview: {plan_error}")
+
+            entry = {
+                "time": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                "type": media_type,
+                "title": title,
+                "year": year,
+                "imdb_id": imdb_id,
+                "season": season if media_type == "tv" else "",
+                "count": 0,
+                "destination": destination,
+                "jellyfin": "",
+                "status": "success",
+                "import_type": "manual",
+                "source": source,
+                "source_key": source_key,
+                "diagnostics": [],
+            }
+
+            db = save_import_aliases(db, source_key, source, entry)
+            marked.append({"title": title, "source": source, "source_key": source_key})
+
+        save_import_db(db)
+        log(f"Bulk manual import mark: marked={len(marked)} errors={len(errors)}")
+        return JSONResponse({"ok": True, "marked": marked, "errors": errors})
+    except Exception as e:
+        log(f"ERROR bulk manual import mark: {e}")
         return JSONResponse({"ok": False, "error": str(e)})
 
 

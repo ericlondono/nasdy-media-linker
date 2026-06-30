@@ -108,7 +108,7 @@ p { color: #b8bfcc; }
 .torrent-card.imported::before { background: #6e8cff; }
 .torrent-topline {
   display: grid;
-  grid-template-columns: 30px minmax(0, 1fr);
+  grid-template-columns: 34px minmax(0, 1fr) 44px;
   gap: 10px;
   align-items: start;
   margin-bottom: 8px;
@@ -126,15 +126,17 @@ p { color: #b8bfcc; }
 .torrent-heading {
   display: flex;
   align-items: flex-start;
-  justify-content: space-between;
+  justify-content: flex-start;
   gap: 8px;
   min-width: 0;
+  padding-right: 0;
 }
 .folder-title {
   display: block;
   font-weight: 950;
   line-height: 1.18;
   overflow-wrap: anywhere;
+  min-width: 0;
 }
 .year-pill {
   flex: 0 0 auto;
@@ -148,7 +150,8 @@ p { color: #b8bfcc; }
 }
 .release-name {
   display: block;
-  margin-left: 40px;
+  margin-left: 44px;
+  margin-right: 44px;
   margin-bottom: 10px;
   color: #7f8aa0;
   font-size: 11px;
@@ -160,7 +163,8 @@ p { color: #b8bfcc; }
   gap: 7px;
   flex-wrap: wrap;
   align-items: center;
-  margin-left: 40px;
+  margin-left: 44px;
+  margin-right: 44px;
   margin-bottom: 10px;
 }
 .mini-pill {
@@ -176,7 +180,8 @@ p { color: #b8bfcc; }
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 8px;
-  margin-left: 40px;
+  margin-left: 44px;
+  margin-right: 44px;
 }
 .metric {
   background: #0c1119;
@@ -326,3 +331,322 @@ button:disabled {
   cursor: not-allowed;
 }
 
+.bulk-toolbar {
+  display: grid;
+  grid-template-columns: auto 1fr auto auto;
+  gap: 8px;
+  align-items: center;
+  margin: 0 0 12px;
+  padding: 10px;
+  border: 1px solid #343a49;
+  background: #0f131c;
+  border-radius: 13px;
+}
+.bulk-select-all {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0;
+  color: #cfd6e3;
+  font-size: 12px;
+  font-weight: 900;
+  white-space: nowrap;
+}
+.bulk-select-all input { width: auto; }
+.selected-count {
+  color: #aeb6c5;
+  font-size: 12px;
+  font-weight: 850;
+}
+button.small {
+  padding: 8px 10px;
+  border-radius: 9px;
+  font-size: 12px;
+}
+button.ghost {
+  background: #2a2f3b;
+  color: #c8cfdb;
+}
+.select-box-wrap {
+  position: absolute;
+  top: 12px;
+  right: 12px;
+  z-index: 3;
+  width: 24px;
+  height: 24px;
+  display: grid;
+  place-items: center;
+  background: #0c1119;
+  border: 1px solid #343a49;
+  border-radius: 8px;
+}
+.queue-select {
+  width: 16px;
+  height: 16px;
+  margin: 0;
+  cursor: pointer;
+}
+.torrent-card.selected {
+  border-color: #6e8cff;
+  background: linear-gradient(135deg, #171f3a, #11141b 72%);
+}
+.torrent-card.selected::before { background: #6e8cff; }
+.torrent-card.imported .select-box-wrap {
+  opacity: .35;
+  pointer-events: none;
+}
+@media (max-width: 720px) {
+  .bulk-toolbar { grid-template-columns: 1fr; }
+}
+
+
+
+/* v3.4.5 card layout final reset */
+.bulk-toolbar {
+  display: grid !important;
+  grid-template-columns: auto minmax(0, 1fr) auto !important;
+  gap: 9px !important;
+  align-items: center !important;
+  margin: 12px 0 12px !important;
+  padding: 12px !important;
+  border: 1px solid #343a49 !important;
+  border-radius: 14px !important;
+  background: #10141d !important;
+}
+
+.bulk-select-all {
+  grid-column: 1 !important;
+  display: flex !important;
+  align-items: center !important;
+  gap: 8px !important;
+  margin: 0 !important;
+  color: #cfd6e3 !important;
+  font-size: 12px !important;
+  font-weight: 900 !important;
+  white-space: nowrap !important;
+}
+
+.bulk-select-all input {
+  width: 16px !important;
+  height: 16px !important;
+  padding: 0 !important;
+  margin: 0 !important;
+}
+
+.selected-count,
+#selectedCount {
+  grid-column: 2 !important;
+  color: #aeb6c5 !important;
+  font-size: 12px !important;
+  font-weight: 900 !important;
+  white-space: nowrap !important;
+}
+
+#clearSelectionBtn {
+  grid-column: 3 !important;
+  justify-self: end !important;
+}
+
+#bulkMarkImportedBtn {
+  grid-column: 1 / -1 !important;
+  width: 100% !important;
+  justify-self: stretch !important;
+}
+
+button.small {
+  padding: 9px 12px !important;
+  border-radius: 10px !important;
+  font-size: 12px !important;
+  line-height: 1.2 !important;
+}
+
+button.ghost {
+  background: #2a2f3b !important;
+  color: #c8cfdb !important;
+}
+
+.folder-list {
+  gap: 12px !important;
+}
+
+.folder.torrent-card,
+.torrent-card.folder {
+  position: relative !important;
+  display: block !important;
+  width: 100% !important;
+  padding: 16px 60px 15px 16px !important;
+  overflow: hidden !important;
+  min-height: 0 !important;
+}
+
+.torrent-card::before {
+  content: "" !important;
+  position: absolute !important;
+  inset: 0 auto 0 0 !important;
+  width: 4px !important;
+  background: #2dbd6e !important;
+  opacity: .9 !important;
+}
+
+.torrent-card.imported::before {
+  background: #6e8cff !important;
+}
+
+.torrent-card.selected::before {
+  background: #6e8cff !important;
+}
+
+.select-box-wrap {
+  position: absolute !important;
+  top: 16px !important;
+  right: 16px !important;
+  z-index: 10 !important;
+  width: 26px !important;
+  height: 26px !important;
+  display: grid !important;
+  place-items: center !important;
+  background: #0c1119 !important;
+  border: 1px solid #343a49 !important;
+  border-radius: 8px !important;
+}
+
+.queue-select {
+  position: static !important;
+  display: block !important;
+  width: 16px !important;
+  height: 16px !important;
+  min-width: 16px !important;
+  padding: 0 !important;
+  margin: 0 !important;
+  cursor: pointer !important;
+  accent-color: #2dbd6e !important;
+}
+
+.torrent-topline {
+  display: grid !important;
+  grid-template-columns: 40px minmax(0, 1fr) !important;
+  gap: 12px !important;
+  align-items: start !important;
+  margin: 0 0 8px !important;
+  min-width: 0 !important;
+}
+
+.torrent-icon {
+  grid-column: 1 !important;
+  width: 34px !important;
+  min-width: 34px !important;
+  height: 30px !important;
+  display: grid !important;
+  place-items: center !important;
+  border-radius: 10px !important;
+  background: #202634 !important;
+  color: #f5f7fb !important;
+  font-size: 13px !important;
+  font-weight: 950 !important;
+  line-height: 1 !important;
+  overflow: hidden !important;
+  white-space: nowrap !important;
+}
+
+.torrent-heading {
+  grid-column: 2 !important;
+  display: grid !important;
+  grid-template-columns: minmax(0, 1fr) auto !important;
+  gap: 8px !important;
+  align-items: start !important;
+  justify-content: stretch !important;
+  min-width: 0 !important;
+  padding-right: 0 !important;
+}
+
+.folder-title {
+  display: block !important;
+  min-width: 0 !important;
+  max-width: 100% !important;
+  font-weight: 950 !important;
+  line-height: 1.18 !important;
+  white-space: normal !important;
+  overflow: visible !important;
+  text-overflow: clip !important;
+  overflow-wrap: anywhere !important;
+  padding-right: 0 !important;
+}
+
+.year-pill {
+  position: static !important;
+  justify-self: end !important;
+  align-self: start !important;
+  flex: 0 0 auto !important;
+  width: auto !important;
+  min-width: 44px !important;
+  max-width: none !important;
+  margin: 0 !important;
+  padding: 3px 8px !important;
+  text-align: center !important;
+  white-space: nowrap !important;
+  overflow: visible !important;
+  text-overflow: clip !important;
+}
+
+.release-name,
+.torrent-status-row,
+.metric-grid {
+  margin-left: 52px !important;
+  margin-right: 0 !important;
+}
+
+.release-name {
+  display: block !important;
+  margin-bottom: 10px !important;
+  color: #7f8aa0 !important;
+  font-size: 11px !important;
+  line-height: 1.25 !important;
+  overflow-wrap: anywhere !important;
+}
+
+.torrent-status-row {
+  display: flex !important;
+  gap: 7px !important;
+  flex-wrap: wrap !important;
+  align-items: center !important;
+  margin-bottom: 10px !important;
+}
+
+.metric-grid {
+  display: grid !important;
+  grid-template-columns: repeat(2, minmax(0, 1fr)) !important;
+  gap: 8px !important;
+}
+
+.metric-value,
+.status-chip,
+.mini-pill {
+  white-space: nowrap !important;
+}
+
+.folder-meta {
+  display: block !important;
+  margin-left: 52px !important;
+  color: #aeb6c5 !important;
+  font-size: 13px !important;
+}
+
+.torrent-card.imported .select-box-wrap {
+  opacity: .35 !important;
+  pointer-events: none !important;
+}
+
+@media (max-width: 720px) {
+  .bulk-toolbar {
+    grid-template-columns: 1fr !important;
+  }
+  .bulk-select-all,
+  .selected-count,
+  #clearSelectionBtn,
+  #bulkMarkImportedBtn {
+    grid-column: 1 !important;
+    justify-self: stretch !important;
+    width: 100% !important;
+  }
+}
+/* end v3.4.5 card layout final reset */

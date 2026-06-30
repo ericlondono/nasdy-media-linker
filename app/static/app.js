@@ -270,7 +270,7 @@ async function markSelectedImported() {
     setActionMessage(data.error || "Could not mark this item imported.", true);
     if (btn) {
       btn.disabled = false;
-      btn.textContent = "✓ Mark Imported";
+      btn.textContent = "Mark Imported";
     }
     return;
   }
@@ -306,10 +306,117 @@ async function unmarkSelectedImported() {
   window.location.reload();
 }
 
+
+function selectedQueueItems() {
+  return Array.from(document.querySelectorAll(".queue-select:checked")).map(box => ({
+    source: box.dataset.source || "",
+    source_key: box.dataset.sourceKey || box.dataset.source || "",
+    media_type: box.dataset.type || "tv",
+    title: box.dataset.title || "",
+    year: box.dataset.year || "",
+    imdb_id: "",
+    season: box.dataset.season || "01",
+  }));
+}
+
+function visibleQueueCheckboxes() {
+  return Array.from(document.querySelectorAll(".torrent-card:not(.hidden) .queue-select"))
+    .filter(box => box.dataset.imported !== "true");
+}
+
+function updateBulkControls() {
+  const selected = selectedQueueItems();
+  const count = selected.length;
+  const countEl = $("#selectedCount");
+  const bulkBtn = $("#bulkMarkImportedBtn");
+  const clearBtn = $("#clearSelectionBtn");
+  const selectAll = $("#selectAllReady");
+  const visible = visibleQueueCheckboxes();
+  const checkedVisible = visible.filter(box => box.checked);
+
+  if (countEl) countEl.textContent = `${count} selected`;
+  if (bulkBtn) bulkBtn.disabled = count === 0;
+  if (clearBtn) clearBtn.disabled = count === 0;
+
+  if (selectAll) {
+    selectAll.checked = visible.length > 0 && checkedVisible.length === visible.length;
+    selectAll.indeterminate = checkedVisible.length > 0 && checkedVisible.length < visible.length;
+    selectAll.disabled = visible.length === 0;
+  }
+
+  document.querySelectorAll(".torrent-card").forEach(card => {
+    const box = card.querySelector(".queue-select");
+    card.classList.toggle("selected", !!box && box.checked);
+  });
+}
+
+function clearQueueSelection() {
+  document.querySelectorAll(".queue-select").forEach(box => { box.checked = false; });
+  updateBulkControls();
+}
+
+async function bulkMarkSelectedImported() {
+  const items = selectedQueueItems();
+  if (!items.length) {
+    setActionMessage("Select one or more Ready items first.", true);
+    return;
+  }
+
+  const btn = $("#bulkMarkImportedBtn");
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = "Marking...";
+  }
+
+  const data = await postJson("/api/imports/mark-bulk", { items });
+  if (!data.ok) {
+    setActionMessage(data.error || "Could not mark selected items imported.", true);
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = "Mark Selected Imported";
+    }
+    updateBulkControls();
+    return;
+  }
+
+  const marked = Array.isArray(data.marked) ? data.marked.length : 0;
+  const errors = Array.isArray(data.errors) ? data.errors.length : 0;
+  setActionMessage(`Marked ${marked} item(s) imported${errors ? `, with ${errors} error(s)` : ""}. Refreshing queue...`, errors > 0);
+  window.location.reload();
+}
+
 document.addEventListener("DOMContentLoaded", () => {
   document.querySelectorAll(".folder").forEach(card => {
-    card.addEventListener("click", () => fillFromCard(card));
+    card.addEventListener("click", (event) => {
+      if (event.target && event.target.classList && event.target.classList.contains("queue-select")) {
+        event.stopPropagation();
+        updateBulkControls();
+        return;
+      }
+      fillFromCard(card);
+    });
   });
+
+  document.querySelectorAll(".queue-select").forEach(box => {
+    box.addEventListener("click", event => event.stopPropagation());
+    box.addEventListener("change", updateBulkControls);
+  });
+
+  const selectAllReady = $("#selectAllReady");
+  if (selectAllReady) {
+    selectAllReady.addEventListener("change", () => {
+      visibleQueueCheckboxes().forEach(box => { box.checked = selectAllReady.checked; });
+      updateBulkControls();
+    });
+  }
+
+  const clearSelectionBtn = $("#clearSelectionBtn");
+  if (clearSelectionBtn) clearSelectionBtn.addEventListener("click", clearQueueSelection);
+
+  const bulkMarkBtn = $("#bulkMarkImportedBtn");
+  if (bulkMarkBtn) bulkMarkBtn.addEventListener("click", bulkMarkSelectedImported);
+
+  document.addEventListener("queueFiltersChanged", updateBulkControls);
 
   document.querySelectorAll('input[name="media_type"]').forEach(radio => {
     radio.addEventListener("change", () => {
@@ -338,5 +445,6 @@ document.addEventListener("DOMContentLoaded", () => {
 
   if (first) fillFromCard(first);
 
+  updateBulkControls();
   updateSeasonVisibility();
 });
