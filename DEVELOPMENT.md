@@ -502,3 +502,66 @@ Manual scan items use:
 
 Design note:
 - This makes NASDY Media Linker a true downloads import manager instead of only a qBittorrent completed-torrent importer.
+## v3.6.2.1 Active qBittorrent Guard
+
+Fix after Manual Downloads Scan.
+
+Problem:
+- Manual Scan made manually copied files/folders visible, but it also saw files that qBittorrent was still actively downloading.
+- Those incomplete files should not be importable yet.
+
+Behavior:
+- If qBittorrent knows about a torrent and `progress < 1`, Manual Scan hides the matching file/folder.
+- If qBittorrent knows about a torrent and it is complete, qBittorrent Completed shows it normally.
+- If no qBittorrent torrent matches the file/folder, Manual Scan shows it.
+
+Queue source examples:
+- `qBittorrent + Manual Scan (2 manual, 1 active hidden)`
+- `qBittorrent`
+- `Manual Scan`
+
+Design note:
+- Manual Scan should make NASDY Media Linker flexible, not unsafe.
+- Incomplete qBittorrent downloads remain hidden until qBittorrent reports them complete.
+## v3.6.2.1 Legacy TV Season Parser Fix
+
+Problem:
+- Complete-series TV packs such as `Reno 911! Complete` could pollute the show title with pack descriptors.
+- Legacy episode names such as `5x01` exposed the episode number but not the season number to the planner, causing files to fall back to `Season 01` / `S01E01`.
+- Some Import Manager TV rows could inherit a default season before checking stronger filename signals.
+
+Change:
+- Adds explicit support for legacy TV patterns such as `5x01`, `05x01`, and `5 x 01` in season and episode parsing.
+- Cleans TV show titles by removing pack descriptors such as `Complete`, `Collection`, `Pack`, season labels, and release words while preserving punctuation from filenames when useful.
+- Prefers filename/folder season evidence before defaulting to Season 01.
+- Updates the Import Manager version badge to match the backend app version.
+
+Expected Reno 911 result:
+- `Reno 911! Complete` imports under `/media/tv/Reno 911!/`.
+- `Reno 911 Season 5` and filenames like `Reno 911! - 5x01 - Title.avi` import under `Season 05` as `S05E01`.
+## v3.6.2.2 qBittorrent State Annotation
+
+Fix after v3.6.2.1.
+
+Problem:
+- Active qBittorrent downloads were correctly hidden from Manual Scan.
+- After completion, some items could still appear through Manual Scan rather than `qbit_completed_items()`.
+- Those rows showed `state = manual scan` even though qBittorrent still knew about the torrent.
+
+Behavior:
+- If Manual Scan finds a file/folder that matches a completed qBittorrent torrent, the row now adopts qBittorrent metadata:
+  - `state`
+  - `hash`
+  - `ratio`
+  - `tracker`
+  - `category`
+  - `tags`
+- Active/incomplete qBittorrent downloads are still hidden.
+- Manual files with no qBittorrent match still show as manual.
+
+Expected state examples:
+- `uploading`
+- `stalledUP`
+- `queuedUP`
+- `completed`
+- `manual scan` only when no qBittorrent torrent matches.

@@ -96,7 +96,7 @@ def queue_items(settings):
             return _apply_advisor(folder_items()), "Folders", f"qBittorrent error: {e}"
 
     return _apply_advisor(folder_items()), "Folders", None
-# v3.6.2.0 Manual Downloads Scan
+# v3.6.2.2 Manual Downloads Scan
 # Adds manually copied files/folders in /downloads to the queue even when qBittorrent is enabled.
 
 def _manual_scan_is_video(path):
@@ -287,7 +287,7 @@ def _queue_merge_manual(qbit_items, manual_items):
 
 def queue_items(settings):
     """
-    v3.6.2.0 behavior:
+    v3.6.2.2 behavior:
     - qBittorrent enabled: show qBittorrent completed items PLUS manual scan items.
     - qBittorrent error: fall back to Manual Scan.
     - qBittorrent disabled: Manual Scan is the queue source.
@@ -313,4 +313,356 @@ def queue_items(settings):
 
     return manual_scan_items(settings, exclude_paths=set()), "Manual Scan", None
 
-# end v3.6.2.0 Manual Downloads Scan
+# end v3.6.2.2 Manual Downloads Scan
+# v3.6.2.2 Active qBittorrent Guard
+# Manual Scan should not expose files that qBittorrent is still downloading.
+# Rule:
+# - If qBittorrent knows the torrent and progress < 1, hide the manual item.
+# - If qBittorrent knows the torrent and progress >= 1, qBittorrent Completed shows it.
+# - If no qBittorrent torrent matches the path, Manual Scan can show it.
+
+def _qbit_download_candidate_paths(settings, torrent):
+    from pathlib import Path
+
+    try:
+        from app.config import DOWNLOADS_ROOT
+        from app.services.qbittorrent import normalize_source_path
+    except Exception:
+        DOWNLOADS_ROOT = Path("/downloads")
+
+        def normalize_source_path(value):
+            return str(value or "").replace("\\", "/").rstrip("/")
+
+    paths = set()
+
+    def add_path(value):
+        text = normalize_source_path(str(value or "")).rstrip("/")
+        if not text:
+            return
+
+        # Never exclude the entire downloads root; that would hide every manual item.
+        try:
+            if text == str(DOWNLOADS_ROOT).rstrip("/"):
+                return
+        except Exception:
+            pass
+
+        paths.add(text)
+
+    save_path = normalize_source_path((torrent or {}).get("save_path") or "")
+    content_path = normalize_source_path((torrent or {}).get("content_path") or "")
+    name = (torrent or {}).get("name") or ""
+
+    add_path(content_path)
+
+    if save_path and name:
+        add_path(str(Path(save_path) / name))
+
+    # For active downloads, qBittorrent may have the real file list even before complete.
+    # Use it to hide single bare files and nested folders accurately.
+    try:
+        from app.services.qbittorrent import qbit_torrent_files
+        files = qbit_torrent_files(settings, (torrent or {}).get("hash", ""))
+    except Exception:
+        files = []
+
+    if save_path and files:
+        roots = set()
+
+        for file_info in files:
+            file_name = str((file_info or {}).get("name") or "").strip()
+            if not file_name:
+                continue
+
+            file_path = Path(file_name)
+            add_path(str(Path(save_path) / file_path))
+
+            # Also add the top folder for folder torrents.
+            if len(file_path.parts) > 1:
+                roots.add(file_path.parts[0])
+
+        for root in roots:
+            add_path(str(Path(save_path) / root))
+
+    return paths
+
+
+def _qbit_active_download_paths(settings):
+    try:
+        from app.services.qbittorrent import qbit_torrents
+    except Exception as error:
+        return set(), 0, f"qBittorrent active-download guard unavailable: {error}"
+
+    active_paths = set()
+    active_count = 0
+
+    try:
+        torrents = qbit_torrents(settings)
+    except Exception as error:
+        return set(), 0, f"qBittorrent active-download guard failed: {error}"
+
+    for torrent in torrents or []:
+        try:
+            progress = float((torrent or {}).get("progress", 0) or 0)
+        except Exception:
+            progress = 0
+
+        state = str((torrent or {}).get("state", "") or "").lower()
+
+        # qBittorrent states vary, but progress < 1 is the reliable signal.
+        # The state list is an extra safety net for metadata/checking/allocation states.
+        active_state = state in {
+            "downloading",
+            "stalleddl",
+            "queueddl",
+            "forceddl",
+            "metadl",
+            "checkingdl",
+            "allocating",
+            "pauseddl",
+            "missingfiles",
+            "error",
+        }
+
+        if progress >= 1 and not active_state:
+            continue
+
+        candidates = _qbit_download_candidate_paths(settings, torrent)
+        if candidates:
+            active_count += 1
+            active_paths.update(candidates)
+
+    return active_paths, active_count, None
+
+
+def queue_items(settings):
+    """
+    v3.6.2.2 behavior:
+    - qBittorrent completed items still show normally.
+    - Manual Scan still shows manually copied files/folders.
+    - Manual Scan excludes paths that belong to incomplete qBittorrent torrents.
+    """
+    settings = settings or {}
+
+    if settings.get("qbittorrent_enabled"):
+        try:
+            qbit_items = qbit_completed_items(settings)
+            qbit_paths = {
+                item.get("path") or item.get("source_key") or ""
+                for item in qbit_items or []
+                if item.get("path") or item.get("source_key")
+            }
+
+            active_paths, active_count, active_error = _qbit_active_download_paths(settings)
+            exclude_paths = set(qbit_paths) | set(active_paths)
+
+            manual_items = manual_scan_items(settings, exclude_paths=exclude_paths)
+            merged = _queue_merge_manual(qbit_items, manual_items)
+
+            source_bits = ["qBittorrent + Manual Scan"]
+            if manual_items:
+                source_bits.append(f"{len(manual_items)} manual")
+            if active_count:
+                source_bits.append(f"{active_count} active hidden")
+
+            source_label = " (" + ", ".join(source_bits[1:]) + ")" if len(source_bits) > 1 else ""
+            warning = active_error
+
+            return merged, source_bits[0] + source_label, warning
+
+        except Exception as e:
+            manual_items = manual_scan_items(settings, exclude_paths=set())
+            return manual_items, "Manual Scan", f"qBittorrent error: {e}"
+
+    return manual_scan_items(settings, exclude_paths=set()), "Manual Scan", None
+
+# end v3.6.2.2 Active qBittorrent Guard
+# v3.6.2.2 qBittorrent State Annotation
+# Manual Scan can still be the row source for a completed qBittorrent torrent if the
+# completed-torrent list does not include the item. In that case, show qBittorrent's
+# current state/ratio/category/hash instead of "manual scan".
+
+def _qbit_state_display(torrent):
+    state = str((torrent or {}).get("state", "") or "").strip()
+    if state:
+        return state
+
+    try:
+        progress = float((torrent or {}).get("progress", 0) or 0)
+    except Exception:
+        progress = 0
+
+    return "completed" if progress >= 1 else "downloading"
+
+
+def _qbit_torrent_records(settings):
+    try:
+        from app.services.qbittorrent import qbit_torrents
+    except Exception as error:
+        return [], f"qBittorrent state annotation unavailable: {error}"
+
+    try:
+        torrents = qbit_torrents(settings)
+    except Exception as error:
+        return [], f"qBittorrent state annotation failed: {error}"
+
+    records = []
+
+    for torrent in torrents or []:
+        try:
+            progress = float((torrent or {}).get("progress", 0) or 0)
+        except Exception:
+            progress = 0
+
+        state = str((torrent or {}).get("state", "") or "").lower()
+
+        active_state = state in {
+            "downloading",
+            "stalleddl",
+            "queueddl",
+            "forceddl",
+            "metadl",
+            "checkingdl",
+            "allocating",
+            "pauseddl",
+            "missingfiles",
+            "error",
+        }
+
+        paths = _qbit_download_candidate_paths(settings, torrent)
+
+        records.append({
+            "torrent": torrent,
+            "paths": paths,
+            "progress": progress,
+            "state": state,
+            "active": bool(progress < 1 or active_state),
+        })
+
+    return records, None
+
+
+def _qbit_match_record_for_path(path, records, require_complete=False):
+    best = None
+    best_score = -1
+
+    for record in records or []:
+        if require_complete and record.get("active"):
+            continue
+
+        paths = record.get("paths") or set()
+        if not paths:
+            continue
+
+        if not _manual_scan_overlaps(path, paths):
+            continue
+
+        # Prefer exact/longer path matches when multiple torrents overlap.
+        candidate_norms = {k.replace("\\", "/").rstrip("/") for k in _manual_scan_keyset(path)}
+        record_norms = set()
+        for p in paths:
+            record_norms.update(k.replace("\\", "/").rstrip("/") for k in _manual_scan_keyset(p))
+
+        score = 0
+        for c in candidate_norms:
+            for r in record_norms:
+                if c == r:
+                    score = max(score, 100000 + len(c))
+                elif c.startswith(r + "/") or r.startswith(c + "/"):
+                    score = max(score, min(len(c), len(r)))
+
+        if score > best_score:
+            best_score = score
+            best = record
+
+    return best
+
+
+def _annotate_manual_items_with_qbit_state(manual_items, records):
+    annotated = []
+    matched_count = 0
+
+    for item in manual_items or []:
+        new_item = dict(item or {})
+        source_path = new_item.get("path") or new_item.get("source_key") or new_item.get("name") or ""
+
+        record = _qbit_match_record_for_path(source_path, records, require_complete=True)
+
+        if record:
+            torrent = record.get("torrent") or {}
+            matched_count += 1
+
+            new_item["state"] = _qbit_state_display(torrent)
+            new_item["hash"] = torrent.get("hash") or new_item.get("hash") or ""
+            new_item["ratio"] = torrent.get("ratio", new_item.get("ratio", ""))
+            new_item["tracker"] = torrent.get("tracker") or new_item.get("tracker") or ""
+            new_item["category"] = torrent.get("category") or new_item.get("category") or ""
+            new_item["tags"] = torrent.get("tags") or new_item.get("tags") or ""
+            new_item["qbit_matched"] = True
+            new_item["qbit_progress"] = record.get("progress")
+            new_item["source_kind"] = "manual_scan_qbit_match"
+            new_item["source_note"] = "Manual Scan path matched completed qBittorrent torrent"
+
+        annotated.append(new_item)
+
+    return annotated, matched_count
+
+
+def queue_items(settings):
+    """
+    v3.6.2.2 behavior:
+    - Active qBittorrent downloads are still hidden from Manual Scan.
+    - Completed qBittorrent downloads show qBittorrent state even if the row came
+      through Manual Scan instead of qbit_completed_items().
+    """
+    settings = settings or {}
+
+    if settings.get("qbittorrent_enabled"):
+        try:
+            qbit_items = qbit_completed_items(settings)
+
+            qbit_completed_paths = {
+                item.get("path") or item.get("source_key") or ""
+                for item in qbit_items or []
+                if item.get("path") or item.get("source_key")
+            }
+
+            records, record_error = _qbit_torrent_records(settings)
+
+            active_paths = set()
+            active_count = 0
+            for record in records or []:
+                if record.get("active") and record.get("paths"):
+                    active_count += 1
+                    active_paths.update(record.get("paths") or set())
+
+            # Exclude completed qbit rows already represented by qbit_completed_items,
+            # and exclude incomplete downloads so they do not appear early.
+            exclude_paths = set(qbit_completed_paths) | set(active_paths)
+
+            manual_items = manual_scan_items(settings, exclude_paths=exclude_paths)
+            manual_items, matched_manual_count = _annotate_manual_items_with_qbit_state(manual_items, records)
+
+            merged = _queue_merge_manual(qbit_items, manual_items)
+
+            detail_bits = []
+            if manual_items:
+                detail_bits.append(f"{len(manual_items)} manual")
+            if matched_manual_count:
+                detail_bits.append(f"{matched_manual_count} qBT state matched")
+            if active_count:
+                detail_bits.append(f"{active_count} active hidden")
+
+            source_label = "qBittorrent + Manual Scan"
+            if detail_bits:
+                source_label += " (" + ", ".join(detail_bits) + ")"
+
+            return merged, source_label, record_error
+
+        except Exception as e:
+            manual_items = manual_scan_items(settings, exclude_paths=set())
+            return manual_items, "Manual Scan", f"qBittorrent error: {e}"
+
+    return manual_scan_items(settings, exclude_paths=set()), "Manual Scan", None
+
+# end v3.6.2.2 qBittorrent State Annotation
