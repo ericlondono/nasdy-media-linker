@@ -565,3 +565,15 @@ Expected state examples:
 - `queuedUP`
 - `completed`
 - `manual scan` only when no qBittorrent torrent matches.
+## Deploy v3.0.1 Cleanup Release
+
+Infrastructure polish after Deploy v3 SSH-key setup.
+
+Changes:
+- Replaces the previous stdin pipe with raw LF-safe SSH script execution.
+- Normalizes `.deploy.sh` to Unix LF line endings before packaging.
+- Converts `.deploy.sh` to LF again on the NAS before execution as a safety net.
+- Keeps SSH-key authentication through `%USERPROFILE%\.ssh\nasdy_ed25519`.
+- Keeps password SSH fallback if key-only authentication is not ready.
+- Keeps Docker build on NASDY, container restart, `/mnt:/host_mnt`, `/host_mnt` verification, and `/health` verification.
+- Adds a clean Deploy v3.0.1 completion banner.

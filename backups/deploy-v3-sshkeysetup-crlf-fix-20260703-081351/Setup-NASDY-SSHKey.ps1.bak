@@ -1,0 +1,245 @@
+# NASDY Media Linker - SSH key setup helper
+# Generated for Deploy v3.
+# Fixed: Windows PowerShell 5 can drop empty-string native arguments, so this
+# script invokes ssh-keygen through ProcessStartInfo when creating a no-passphrase key.
+
+[CmdletBinding()]
+param(
+    [string]$HostName = "NASDY",
+    [string]$User = "root",
+    [string]$KeyPath = (Join-Path $env:USERPROFILE ".ssh\nasdy_ed25519"),
+    [switch]$ForceNewKey,
+    [switch]$PromptForPassphrase
+)
+
+$ErrorActionPreference = "Stop"
+Set-StrictMode -Version 2.0
+
+function Write-Info {
+    param([string]$Message)
+    Write-Host "[NASDY SSH] $Message" -ForegroundColor Cyan
+}
+
+function Write-Good {
+    param([string]$Message)
+    Write-Host "[OK] $Message" -ForegroundColor Green
+}
+
+function Assert-Command {
+    param([string]$Name)
+    if (-not (Get-Command $Name -ErrorAction SilentlyContinue)) {
+        throw "Required command '$Name' was not found in PATH. Install/enable Windows OpenSSH first."
+    }
+}
+
+function Invoke-NativeChecked {
+    param(
+        [string]$FilePath,
+        [string[]]$Arguments,
+        [string]$FriendlyName
+    )
+
+    & $FilePath @Arguments
+    $code = $LASTEXITCODE
+    if ($code -ne 0) {
+        throw "$FriendlyName failed with exit code $code."
+    }
+}
+
+function ConvertTo-ProcessArgument {
+    param([string]$Value)
+
+    if ($null -eq $Value) {
+        return '""'
+    }
+
+    # Good enough for the controlled values used here: Windows paths and comments.
+    # The important part is that -N "" is passed by .NET ProcessStartInfo, not by
+    # Windows PowerShell's native-command binder, which drops empty-string args.
+    return '"' + ([string]$Value).Replace('"', '\"') + '"'
+}
+
+function Invoke-SshKeygenNoPassphrase {
+    param(
+        [string]$KeyPath,
+        [string]$Comment
+    )
+
+    $arguments = "-t ed25519 -f $(ConvertTo-ProcessArgument $KeyPath) -N `"`" -C $(ConvertTo-ProcessArgument $Comment)"
+
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = "ssh-keygen"
+    $psi.Arguments = $arguments
+    $psi.UseShellExecute = $false
+    $psi.RedirectStandardInput = $false
+    $psi.RedirectStandardOutput = $false
+    $psi.RedirectStandardError = $false
+
+    $process = [System.Diagnostics.Process]::Start($psi)
+    $process.WaitForExit()
+
+    if ($process.ExitCode -ne 0) {
+        throw "ssh-keygen failed with exit code $($process.ExitCode)."
+    }
+}
+
+function Test-PrivateKeyLooksUsable {
+    param([string]$Path)
+
+    if (-not (Test-Path $Path)) {
+        return $false
+    }
+
+    $item = Get-Item -Path $Path -ErrorAction SilentlyContinue
+    if ($null -eq $item -or $item.Length -lt 64) {
+        return $false
+    }
+
+    $firstLine = Get-Content -Path $Path -TotalCount 1 -ErrorAction SilentlyContinue
+    if (($firstLine -join "`n") -match "BEGIN (OPENSSH|RSA|EC|DSA) PRIVATE KEY") {
+        return $true
+    }
+
+    return $false
+}
+
+function Backup-KeyFiles {
+    param(
+        [string]$KeyPath,
+        [string]$PublicKeyPath,
+        [string]$Stamp,
+        [string]$Reason
+    )
+
+    if (Test-Path $KeyPath) {
+        $privateBackup = "$KeyPath.backup-$Stamp"
+        Move-Item -Path $KeyPath -Destination $privateBackup -Force
+        Write-Info "$Reason Existing private key moved to backup: $privateBackup"
+    }
+
+    if (Test-Path $PublicKeyPath) {
+        $publicBackup = "$PublicKeyPath.backup-$Stamp"
+        Move-Item -Path $PublicKeyPath -Destination $publicBackup -Force
+        Write-Info "$Reason Existing public key moved to backup: $publicBackup"
+    }
+}
+
+function New-DeployKeyPair {
+    param(
+        [string]$KeyPath,
+        [string]$Comment,
+        [switch]$PromptForPassphrase
+    )
+
+    Write-Info "Creating ed25519 key: $KeyPath"
+
+    if ($PromptForPassphrase) {
+        Invoke-NativeChecked -FilePath "ssh-keygen" -Arguments @(
+            "-t", "ed25519",
+            "-f", $KeyPath,
+            "-C", $Comment
+        ) -FriendlyName "ssh-keygen"
+    }
+    else {
+        Invoke-SshKeygenNoPassphrase -KeyPath $KeyPath -Comment $Comment
+    }
+
+    if (-not (Test-PrivateKeyLooksUsable -Path $KeyPath)) {
+        throw "ssh-keygen finished, but the private key was not created correctly: $KeyPath"
+    }
+}
+
+Assert-Command "ssh"
+Assert-Command "ssh-keygen"
+
+$KeyPath = [Environment]::ExpandEnvironmentVariables($KeyPath)
+$KeyDir = Split-Path -Parent $KeyPath
+$PublicKeyPath = "$KeyPath.pub"
+$Remote = "$User@$HostName"
+$Stamp = Get-Date -Format "yyyyMMdd-HHmmss"
+$Comment = "nasdy-media-linker-$env:COMPUTERNAME"
+
+if (-not (Test-Path $KeyDir)) {
+    New-Item -ItemType Directory -Path $KeyDir -Force | Out-Null
+    Write-Good "Created SSH directory: $KeyDir"
+}
+
+if ((Test-Path $KeyPath) -and $ForceNewKey) {
+    Backup-KeyFiles -KeyPath $KeyPath -PublicKeyPath $PublicKeyPath -Stamp $Stamp -Reason "ForceNewKey requested."
+}
+elseif ((Test-Path $KeyPath) -and -not (Test-PrivateKeyLooksUsable -Path $KeyPath)) {
+    Backup-KeyFiles -KeyPath $KeyPath -PublicKeyPath $PublicKeyPath -Stamp $Stamp -Reason "Invalid or partial key found."
+}
+
+if (-not (Test-Path $KeyPath)) {
+    New-DeployKeyPair -KeyPath $KeyPath -Comment $Comment -PromptForPassphrase:$PromptForPassphrase
+}
+else {
+    Write-Good "Using existing private key: $KeyPath"
+}
+
+if (-not (Test-PrivateKeyLooksUsable -Path $KeyPath)) {
+    throw "Private key does not look usable: $KeyPath"
+}
+
+if ((Test-Path $PublicKeyPath) -and ((Get-Item -Path $PublicKeyPath).Length -lt 20)) {
+    Remove-Item -Path $PublicKeyPath -Force
+}
+
+if (-not (Test-Path $PublicKeyPath)) {
+    Write-Info "Public key file is missing; recreating it from the private key."
+    $derivedPublicKey = & ssh-keygen -y -f $KeyPath
+    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace(($derivedPublicKey -join "`n"))) {
+        if ($PromptForPassphrase) {
+            throw "Could not derive public key from $KeyPath. Re-run with -ForceNewKey or create $PublicKeyPath manually."
+        }
+
+        Write-Warning "Could not derive public key from the existing key. Backing it up and creating a clean no-passphrase deploy key."
+        $Stamp = Get-Date -Format "yyyyMMdd-HHmmss"
+        Backup-KeyFiles -KeyPath $KeyPath -PublicKeyPath $PublicKeyPath -Stamp $Stamp -Reason "Could not derive public key."
+        New-DeployKeyPair -KeyPath $KeyPath -Comment $Comment
+    }
+    else {
+        [System.IO.File]::WriteAllText($PublicKeyPath, (($derivedPublicKey -join "`n").Trim() + "`n"), [System.Text.Encoding]::ASCII)
+    }
+}
+
+$PublicKey = (Get-Content -Raw -Encoding ASCII $PublicKeyPath).Trim()
+if ([string]::IsNullOrWhiteSpace($PublicKey)) {
+    throw "Public key file is empty: $PublicKeyPath"
+}
+
+$InstallTemplate = @'
+umask 077
+mkdir -p "$HOME/.ssh"
+touch "$HOME/.ssh/authorized_keys"
+cat >> "$HOME/.ssh/authorized_keys" <<'__NASDY_PUBLIC_KEY__'
+__PUBLIC_KEY__
+__NASDY_PUBLIC_KEY__
+awk 'NF && !seen[$0]++' "$HOME/.ssh/authorized_keys" > "$HOME/.ssh/authorized_keys.tmp"
+mv "$HOME/.ssh/authorized_keys.tmp" "$HOME/.ssh/authorized_keys"
+chmod 700 "$HOME/.ssh"
+chmod 600 "$HOME/.ssh/authorized_keys"
+printf '%s\n' "authorized_keys installed"
+'@
+
+$InstallScript = $InstallTemplate.Replace("__PUBLIC_KEY__", $PublicKey)
+
+Write-Info "Installing public key on $Remote. This uses the existing password path only for setup if the NAS asks for it."
+($InstallScript + "`n") | & ssh $Remote "sh -s"
+$installCode = $LASTEXITCODE
+if ($installCode -ne 0) {
+    throw "Public key install failed with exit code $installCode. Password SSH has not been changed."
+}
+
+Write-Info "Testing key-only SSH login."
+$keyTestOutput = & ssh -i $KeyPath -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=10 $Remote "echo SSH_KEY_OK"
+$keyTestCode = $LASTEXITCODE
+if ($keyTestCode -ne 0 -or (($keyTestOutput -join "`n") -notmatch "SSH_KEY_OK")) {
+    throw "Key install finished, but key-only login did not pass. Password SSH has not been removed or changed."
+}
+
+Write-Good "SSH key works for $Remote"
+Write-Host ""
+Write-Host "Deploy.ps1 will use this key automatically when it exists and passes BatchMode testing:"
+Write-Host "  $KeyPath"

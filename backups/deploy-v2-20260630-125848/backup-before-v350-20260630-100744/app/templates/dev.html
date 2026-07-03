@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>{{ app_name }} Dev</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<main class="shell narrow">
+  <header class="hero">
+    <div>
+      <h1>Developer Mode</h1>
+      <p>{{ app_name }} {{ version }}</p>
+    </div>
+    <div class="hero-actions">
+      <a class="navlink" href="/">Home</a>
+      <a class="navlink" href="/settings">Settings</a>
+    </div>
+  </header>
+
+  <section class="card">
+    <h2>Log</h2>
+    <pre class="diag-box">{{ log }}</pre>
+  </section>
+</main>
+</body>
+</html>

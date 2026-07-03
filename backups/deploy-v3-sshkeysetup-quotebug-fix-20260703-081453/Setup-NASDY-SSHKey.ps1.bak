@@ -1,0 +1,116 @@
+﻿param(
+    [string]$NasHost = "NASDY",
+    [string]$NasUser = "root",
+    [string]$KeyPath = "$env:USERPROFILE\.ssh\nasdy_ed25519",
+    [string]$KeyComment = "nasdy-media-linker-$env:COMPUTERNAME"
+)
+
+$ErrorActionPreference = "Stop"
+
+function Write-Step($Message) { Write-Host "[NASDY SSH] $Message" -ForegroundColor Cyan }
+function Write-Ok($Message) { Write-Host "[OK] $Message" -ForegroundColor Green }
+function Write-Warn($Message) { Write-Host "[WARN] $Message" -ForegroundColor Yellow }
+
+function Invoke-NativeCommand {
+    param(
+        [Parameter(Mandatory=$true)][string]$FriendlyName,
+        [Parameter(Mandatory=$true)][string]$FilePath,
+        [Parameter(Mandatory=$true)][string[]]$Arguments
+    )
+
+    & $FilePath @Arguments
+    $code = $LASTEXITCODE
+    if ($code -ne 0) {
+        throw "$FriendlyName failed with exit code $code."
+    }
+}
+
+function Invoke-NativeCommandAllowFail {
+    param(
+        [Parameter(Mandatory=$true)][string]$FilePath,
+        [Parameter(Mandatory=$true)][string[]]$Arguments
+    )
+
+    & $FilePath @Arguments
+    return $LASTEXITCODE
+}
+
+$ssh = Get-Command ssh -ErrorAction SilentlyContinue
+if (-not $ssh) { throw "OpenSSH client not found. Install Windows OpenSSH Client first." }
+
+$scp = Get-Command scp -ErrorAction SilentlyContinue
+if (-not $scp) { throw "OpenSSH scp not found. Install Windows OpenSSH Client first." }
+
+$keyDir = Split-Path -Parent $KeyPath
+if (-not (Test-Path $keyDir)) {
+    New-Item -ItemType Directory -Force -Path $keyDir | Out-Null
+}
+
+$pubPath = "$KeyPath.pub"
+
+if ((Test-Path $KeyPath) -and -not (Test-Path $pubPath)) {
+    $stamp = Get-Date -Format "yyyyMMdd-HHmmss"
+    Write-Warn "Private key exists but public key is missing. Backing up partial key."
+    Move-Item -Force $KeyPath "$KeyPath.partial-$stamp.bak"
+}
+
+if ((Test-Path $pubPath) -and -not (Test-Path $KeyPath)) {
+    $stamp = Get-Date -Format "yyyyMMdd-HHmmss"
+    Write-Warn "Public key exists but private key is missing. Backing up partial public key."
+    Move-Item -Force $pubPath "$pubPath.partial-$stamp.bak"
+}
+
+if (-not (Test-Path $KeyPath)) {
+    Write-Step "Creating ed25519 key: $KeyPath"
+    $sshKeygen = Get-Command ssh-keygen -ErrorAction SilentlyContinue
+    if (-not $sshKeygen) { throw "ssh-keygen not found. Install Windows OpenSSH Client first." }
+
+    # Windows PowerShell 5.1 can drop an empty string when splatting native args.
+    # Passing two quote characters as the passphrase argument reliably creates a no-passphrase key.
+    $keygenArgs = @("-t", "ed25519", "-f", $KeyPath, "-C", $KeyComment, "-N", '""')
+    Invoke-NativeCommand -FriendlyName "ssh-keygen" -FilePath $sshKeygen.Source -Arguments $keygenArgs
+} else {
+    Write-Ok "SSH key already exists: $KeyPath"
+}
+
+if (-not (Test-Path $pubPath)) {
+    throw "Public key was not created: $pubPath"
+}
+
+# Normalize the public key to one LF-only line.
+$publicKey = (Get-Content -Raw -Path $pubPath).Trim()
+if (-not $publicKey.StartsWith("ssh-ed25519 ")) {
+    throw "Unexpected public key format in: $pubPath"
+}
+
+Write-Step "Installing public key on $NasUser@$NasHost. This uses the existing password path only for setup if the NAS asks for it."
+
+# Avoid sending CRLF shell script text over SSH. Pass the public key as a single shell-quoted argument.
+# This fixes the NAS-side: sh: line ... $'\r': command not found issue.
+$safePublicKey = $publicKey.Replace("'", "'\"'\"'")
+$remoteCommand = "mkdir -p /root/.ssh && chmod 700 /root/.ssh && touch /root/.ssh/authorized_keys && chmod 600 /root/.ssh/authorized_keys && grep -qxF '$safePublicKey' /root/.ssh/authorized_keys || printf '%s`n' '$safePublicKey' >> /root/.ssh/authorized_keys && echo authorized_keys installed"
+
+$installArgs = @("$NasUser@$NasHost", $remoteCommand)
+$installCode = Invoke-NativeCommandAllowFail -FilePath $ssh.Source -Arguments $installArgs
+if ($installCode -ne 0) {
+    throw "Public key install failed with exit code $installCode. Password SSH has not been changed."
+}
+
+Write-Step "Testing key-only SSH login"
+$testArgs = @(
+    "-i", $KeyPath,
+    "-o", "BatchMode=yes",
+    "-o", "PreferredAuthentications=publickey",
+    "-o", "PasswordAuthentication=no",
+    "$NasUser@$NasHost",
+    "echo SSH key works"
+)
+$testCode = Invoke-NativeCommandAllowFail -FilePath $ssh.Source -Arguments $testArgs
+if ($testCode -ne 0) {
+    throw "SSH key test failed with exit code $testCode. Password SSH remains available."
+}
+
+Write-Ok "SSH key authentication is working for $NasUser@$NasHost"
+Write-Host ""
+Write-Host "Next deploy command:" -ForegroundColor Cyan
+Write-Host "  powershell -ExecutionPolicy Bypass -File .\Deploy.ps1"

@@ -1,0 +1,193 @@
+diff --git a/app/services/linker.py b/app/services/linker.py
+--- a/app/services/linker.py
++++ b/app/services/linker.py
+@@ -1,8 +1,8 @@
+ import os
+ from pathlib import Path
+-from app.config import DOWNLOADS_ROOT, MOVIES_ROOT, TV_ROOT, HOST_MNT_ROOT
++from app.config import DOWNLOADS_ROOT, MOVIES_ROOT, TV_ROOT, HOST_MNT_ROOT, HOST_DOWNLOADS_ROOT, HOST_MEDIA_ROOT
+ from app.services.utils import find_videos, detect_episode, safe_name
+ from app.services.logger import log
+@@
+-def container_to_host_user_path(container_path: Path) -> Path:
+-    """
+-    Convert container paths to the host /mnt/user path through /host_mnt mount:
+-    /downloads/foo -> /host_mnt/user/NASDY/downloads/foo
+-    /media/Movies/foo -> /host_mnt/user/NASDY/media/Movies/foo
+-    """
+-    p = Path(container_path)
+-    s = str(p)
+-    if s.startswith("/downloads"):
+-        rel = s.removeprefix("/downloads").lstrip("/")
+-        return HOST_MNT_ROOT / "user" / "NASDY" / "downloads" / rel
+-    if s.startswith("/media"):
+-        rel = s.removeprefix("/media").lstrip("/")
+-        return HOST_MNT_ROOT / "user" / "NASDY" / "media" / rel
+-    return p
++def _host_mnt_path_from_host_path(host_path: str) -> Path:
++    host_path = str(host_path).rstrip("/")
++    if host_path.startswith("/mnt/"):
++        return HOST_MNT_ROOT / host_path.removeprefix("/mnt/").lstrip("/")
++    return Path(host_path)
++
++def container_to_host_user_path(container_path: Path) -> Path:
++    p = Path(container_path)
++    s = str(p)
++    if s.startswith("/downloads"):
++        rel = s.removeprefix("/downloads").lstrip("/")
++        return _host_mnt_path_from_host_path(HOST_DOWNLOADS_ROOT) / rel
++    if s.startswith("/media"):
++        rel = s.removeprefix("/media").lstrip("/")
++        return _host_mnt_path_from_host_path(HOST_MEDIA_ROOT) / rel
++    return p
++
++def _relative_from_host_user(path_inside_host_mnt: Path):
++    try:
++        return path_inside_host_mnt.relative_to(HOST_MNT_ROOT / "user")
++    except Exception:
++        return None
++
++def _disk_roots():
++    roots = []
++    cache = HOST_MNT_ROOT / "cache"
++    if cache.exists():
++        roots.append(cache)
++    roots.extend(sorted([p for p in HOST_MNT_ROOT.glob("disk*") if p.is_dir()]))
++    return roots
+@@
+ def resolve_real_host_path(container_path: Path) -> Path:
+-    """
+-    Resolve a /mnt/user FUSE path to a real /mnt/cache or /mnt/diskX path as exposed inside container.
+-    If the path exists as a file, search by relative path first.
+-    """
+     user_path = container_to_host_user_path(container_path)
+-    s = str(user_path)
+-
+-    # Convert /host_mnt/user/NASDY/... to relative NASDY/...
+-    marker = "/host_mnt/user/"
+-    if s.startswith(marker):
+-        rel = s.removeprefix(marker)
+-    else:
++    rel = _relative_from_host_user(user_path)
++    if rel is None:
+         return user_path
+-
+-    candidates = []
+-    for root in [HOST_MNT_ROOT / "cache"] + sorted(HOST_MNT_ROOT.glob("disk*")):
+-        candidates.append(root / rel)
+-
+-    for c in candidates:
+-        if c.exists():
+-            return c
+-
+-    # For destination that does not exist yet, pick same disk as source later.
++    for root in _disk_roots():
++        candidate = root / rel
++        if candidate.exists():
++            return candidate
+     return user_path
+@@
+ def matching_dest_on_source_disk(src_real: Path, dst_container: Path) -> Path:
+-    """
+-    Given real source path (/host_mnt/cache/NASDY/downloads/...) and destination container path
+-    (/media/Movies/...), create matching destination on same root:
+-    /host_mnt/cache/NASDY/media/Movies/...
+-    """
+-    src_parts = src_real.parts
+-    # /host_mnt/cache/NASDY/... => root = /host_mnt/cache
+-    if len(src_parts) >= 3 and src_parts[1] == "host_mnt":
+-        disk_root = Path("/") / src_parts[1] / src_parts[2]
+-    else:
+-        return container_to_host_user_path(dst_container)
++    src_real = Path(src_real)
++    dst_container = Path(dst_container)
++    disk_root = None
++    for root in _disk_roots():
++        try:
++            src_real.relative_to(root)
++            disk_root = root
++            break
++        except Exception:
++            continue
++    if disk_root is None:
++        return container_to_host_user_path(dst_container)
+
+     dst_s = str(dst_container)
+     if dst_s.startswith("/media"):
+         rel = dst_s.removeprefix("/media").lstrip("/")
+-        return disk_root / "NASDY" / "media" / rel
++        media_user_root = _host_mnt_path_from_host_path(HOST_MEDIA_ROOT)
++        media_rel = _relative_from_host_user(media_user_root)
++        if media_rel is None:
++            return container_to_host_user_path(dst_container)
++        return disk_root / media_rel / rel
+     return container_to_host_user_path(dst_container)
+@@
+ def stat_device(path: Path):
+     try:
+-        st = os.stat(path if path.exists() else path.parent)
++        p = Path(path)
++        probe = p if p.exists() else p.parent
++        while not probe.exists() and probe != probe.parent:
++            probe = probe.parent
++        st = os.stat(probe)
+         return st.st_dev
+     except Exception:
+         return None
+@@
+ def diagnostic_for_link(src_container: Path, dst_container: Path):
+     src_real = resolve_real_host_path(src_container)
+     dst_real = matching_dest_on_source_disk(src_real, dst_container)
++    src_device = stat_device(src_real)
++    dst_parent_device = stat_device(dst_real.parent)
+     return {
+         "src_container": str(src_container),
+         "dst_container": str(dst_container),
++        "src_user_path": str(container_to_host_user_path(src_container)),
++        "dst_user_path": str(container_to_host_user_path(dst_container)),
+         "src_real": str(src_real),
+         "dst_real": str(dst_real),
+         "src_exists": src_real.exists(),
+         "dst_exists": dst_real.exists(),
+-        "src_device": stat_device(src_real),
+-        "dst_parent_device": stat_device(dst_real.parent),
+-        "same_device": stat_device(src_real) == stat_device(dst_real.parent),
++        "src_device": src_device,
++        "dst_parent_device": dst_parent_device,
++        "same_device": src_device == dst_parent_device,
+     }
++
++def destination_exists(item) -> bool:
++    diag = diagnostic_for_link(Path(item["src"]), Path(item["dst"]))
++    return Path(diag["dst_real"]).exists()
+@@
+         if not src_real.exists():
+             raise FileNotFoundError(f"Resolved source does not exist: {src_real}")
+         if dst_real.exists():
+             raise FileExistsError(f"Already exists: {dst_real}")
++        if diag["src_device"] != diag["dst_parent_device"]:
++            raise OSError(f"Source and destination are still on different devices. Diagnostic: {diag}")
+
+         dst_real.parent.mkdir(parents=True, exist_ok=True)
+         os.link(src_real, dst_real)
+diff --git a/app/main.py b/app/main.py
+--- a/app/main.py
++++ b/app/main.py
+@@ -12,7 +12,7 @@
+ from app.config import APP_NAME, APP_VERSION
+ from app.services.storage import load_settings, save_settings, load_import_db, save_import_db, append_history, read_history
+ from app.services.queue import queue_items
+-from app.services.linker import build_plan, create_hard_links, diagnostic_for_link
++from app.services.linker import build_plan, create_hard_links, diagnostic_for_link, destination_exists
+ from app.services.tmdb import tmdb_search
+ from app.services.jellyfin import jellyfin_refresh
+ from app.services.qbittorrent import test_qbit
+@@ -139,7 +139,7 @@
+                 "src": str(i["src"]),
+                 "dst": str(i["dst"]),
+                 "new_name": i["new_name"],
+-                "exists": Path(i["dst"]).exists()
++                "exists": destination_exists(i)
+             } for i in items],
+         })
+     except Exception as e:

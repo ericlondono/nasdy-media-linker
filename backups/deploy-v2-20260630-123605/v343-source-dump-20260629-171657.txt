@@ -1,0 +1,631 @@
+﻿--- app/main.py ---
+from datetime import datetime
+from pathlib import Path
+from typing import Optional
+
+from fastapi import FastAPI, Request, Form
+from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
+
+from app.config import APP_NAME, APP_VERSION
+from app.services.storage import load_settings, save_settings, load_import_db, save_import_db, append_history, read_history
+from app.services.queue import queue_items
+from app.services.linker import build_plan, create_hard_links, diagnostic_for_link
+from app.services.tmdb import tmdb_search
+from app.services.jellyfin import jellyfin_refresh
+from app.services.qbittorrent import test_qbit
+from app.services.library import find_library_match
+from app.services.logger import read_log, log
+
+app = FastAPI(title=APP_NAME)
+app.mount("/static", StaticFiles(directory="app/static"), name="static")
+templates = Jinja2Templates(directory="app/templates")
+
+
+@app.get("/", response_class=HTMLResponse)
+def index(request: Request):
+    settings = load_settings()
+    items, source_label, queue_error = queue_items(settings)
+    return templates.TemplateResponse("index.html", {
+        "request": request,
+        "app_name": APP_NAME,
+        "version": APP_VERSION,
+        "items": items,
+        "source_label": source_label,
+        "queue_error": queue_error,
+        "history": read_history(),
+        "settings": settings,
+        "tmdb_enabled": bool(settings.get("tmdb_api_key")),
+        "jellyfin_enabled": bool(settings.get("jellyfin_url") and settings.get("jellyfin_api_key")),
+        "qbittorrent_enabled": bool(settings.get("qbittorrent_enabled")),
+    })
+
+
+@app.get("/settings", response_class=HTMLResponse)
+def settings_page(request: Request):
+    return templates.TemplateResponse("settings.html", {
+        "request": request,
+        "app_name": APP_NAME,
+        "version": APP_VERSION,
+        "settings": load_settings(),
+    })
+
+
+@app.post("/settings")
+def save_settings_route(
+    qbittorrent_enabled: Optional[str] = Form(None),
+    qbittorrent_url: str = Form(""),
+    qbittorrent_username: str = Form(""),
+    qbittorrent_password: str = Form(""),
+    tmdb_api_key: str = Form(""),
+    jellyfin_url: str = Form(""),
+    jellyfin_api_key: str = Form(""),
+    developer_mode: Optional[str] = Form(None),
+):
+    save_settings({
+        "qbittorrent_enabled": bool(qbittorrent_enabled),
+        "qbittorrent_url": qbittorrent_url.strip().rstrip("/"),
+        "qbittorrent_username": qbittorrent_username.strip(),
+        "qbittorrent_password": qbittorrent_password,
+        "tmdb_api_key": tmdb_api_key.strip(),
+        "jellyfin_url": jellyfin_url.strip().rstrip("/"),
+        "jellyfin_api_key": jellyfin_api_key.strip(),
+        "developer_mode": bool(developer_mode),
+    })
+    return RedirectResponse("/settings?saved=1", status_code=303)
+
+
+@app.post("/api/qbit/test")
+async def api_qbit_test(request: Request):
+    data = await request.json()
+    settings = load_settings()
+    settings.update(data)
+    try:
+        completed = test_qbit(settings)
+        return JSONResponse({"ok": True, "message": f"Connected. {completed} completed torrent(s) found."})
+    except Exception as e:
+        return JSONResponse({"ok": False, "message": str(e)})
+
+
+@app.post("/api/preview")
+async def api_preview(request: Request):
+    data = await request.json()
+    try:
+        media_type = data.get("media_type", "tv")
+        source = data.get("source", "")
+        title = data.get("title", "")
+        year = data.get("year", "")
+        imdb_id = data.get("imdb_id", "").strip()
+        season = data.get("season", "01")
+
+        dest_dir, items = build_plan(media_type, source, title, year, season)
+        settings = load_settings()
+        meta = tmdb_search(settings, media_type, title, year)
+        library_match = find_library_match(media_type, title, year, season)
+
+        db = load_import_db()
+        source_key = data.get("source_key") or source or ""
+        imported = db.get(source_key)
+
+        diagnostics = []
+        for i in items:
+            diagnostics.append(diagnostic_for_link(Path(i["src"]), Path(i["dst"])))
+
+        return JSONResponse({
+            "ok": True,
+            "destination": str(dest_dir),
+            "metadata": {
+                **meta,
+                "imdb_id": imdb_id,
+            },
+            "library_match": library_match,
+            "imported": imported,
+            "diagnostics": diagnostics,
+            "items": [{
+                "src": str(i["src"]),
+                "dst": str(i["dst"]),
+                "new_name": i["new_name"],
+                "exists": Path(i["dst"]).exists()
+            } for i in items],
+        })
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e)})
+
+
+@app.post("/organize")
+def organize(
+    media_type: str = Form(...),
+    source: str = Form(...),
+    source_key: str = Form(""),
+    title: str = Form(...),
+    year: str = Form(""),
+    imdb_id: str = Form(""),
+    season: str = Form("01"),
+    refresh_jellyfin: Optional[str] = Form(None),
+):
+    try:
+        settings = load_settings()
+        dest_dir, items = build_plan(media_type, source, title, year, season)
+        created, diagnostics = create_hard_links(items)
+
+        jf_msg = ""
+        if refresh_jellyfin:
+            _, jf_msg = jellyfin_refresh(settings)
+
+        entry = {
+            "time": datetime.now().strftime("%Y-%m-%d %H:%M"),
+            "type": media_type,
+            "title": title,
+            "year": year,
+            "imdb_id": imdb_id.strip(),
+            "season": season if media_type == "tv" else "",
+            "count": len(created),
+            "destination": str(dest_dir),
+            "jellyfin": jf_msg,
+            "status": "success",
+            "source": source,
+            "diagnostics": diagnostics,
+        }
+        append_history(entry)
+        db = load_import_db()
+        db[source_key or source] = entry
+        save_import_db(db)
+
+        return RedirectResponse("/", status_code=303)
+    except Exception as e:
+        log(f"ERROR organize: {e}")
+        append_history({
+            "time": datetime.now().strftime("%Y-%m-%d %H:%M"),
+            "type": "error",
+            "title": title,
+            "error": str(e),
+            "status": "error",
+        })
+        return RedirectResponse("/", status_code=303)
+
+
+@app.get("/dev", response_class=HTMLResponse)
+def dev_page(request: Request):
+    settings = load_settings()
+    return templates.TemplateResponse("dev.html", {
+        "request": request,
+        "app_name": APP_NAME,
+        "version": APP_VERSION,
+        "settings": settings,
+        "log": read_log(),
+    })
+
+
+@app.post("/api/jellyfin/refresh")
+def api_jellyfin_refresh():
+    ok, msg = jellyfin_refresh(load_settings())
+    return JSONResponse({"ok": ok, "message": msg})
+
+
+@app.get("/health")
+def health():
+    return {
+        "ok": True,
+        "name": APP_NAME,
+        "version": APP_VERSION,
+    }
+
+
+
+--- app/services/qbittorrent.py ---
+from pathlib import Path
+import requests
+
+from app.config import DOWNLOADS_ROOT, VIDEO_EXTENSIONS
+from app.services.storage import load_import_db, read_history
+from app.services.utils import guess_type, strip_release_words, detect_year, detect_season
+
+
+def normalize_source_path(raw_path: str) -> str:
+    if not raw_path:
+        return ""
+    p = raw_path.replace("\\", "/")
+    p = p.replace("/mnt/user/NASDY/downloads", "/downloads")
+    p = p.replace("/mnt/user/downloads", "/downloads")
+    return p.rstrip("/")
+
+
+def normalize_qbit_url(raw_url: str) -> str:
+    url = (raw_url or "").strip().rstrip("/")
+    if url and not url.startswith(("http://", "https://")):
+        url = "http://" + url
+    return url
+
+
+def normalize_match_text(value: str) -> str:
+    return "".join(ch.lower() for ch in str(value or "") if ch.isalnum())
+
+
+def qbit_session(settings):
+    session = requests.Session()
+    url = normalize_qbit_url(settings.get("qbittorrent_url", ""))
+    username = settings.get("qbittorrent_username", "")
+    password = settings.get("qbittorrent_password", "")
+
+    if not url:
+        raise ValueError("qBittorrent URL is required.")
+    if not username:
+        raise ValueError("qBittorrent username is required.")
+
+    login = session.post(
+        f"{url}/api/v2/auth/login",
+        data={"username": username, "password": password},
+        timeout=8,
+    )
+
+    if login.status_code not in (200, 204):
+        raise ValueError(f"qBittorrent login failed. HTTP {login.status_code}: {login.text[:80]}")
+
+    check = session.get(f"{url}/api/v2/app/version", timeout=8)
+    if check.status_code != 200:
+        raise ValueError(
+            f"qBittorrent login could not be verified. "
+            f"Login HTTP {login.status_code}, verify HTTP {check.status_code}: {check.text[:80]}"
+        )
+
+    return session, url
+
+
+def qbit_torrents(settings):
+    session, url = qbit_session(settings)
+    response = session.get(f"{url}/api/v2/torrents/info", timeout=10)
+    response.raise_for_status()
+    return response.json()
+
+
+def qbit_torrent_files(settings, torrent_hash: str):
+    if not torrent_hash:
+        return []
+
+    session, url = qbit_session(settings)
+    response = session.get(
+        f"{url}/api/v2/torrents/files",
+        params={"hash": torrent_hash},
+        timeout=10,
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+def is_video_name(name: str) -> bool:
+    return Path(str(name)).suffix.lower() in VIDEO_EXTENSIONS
+
+
+def completed_video_files(settings, torrent):
+    files = qbit_torrent_files(settings, torrent.get("hash", ""))
+    return [
+        f for f in files
+        if is_video_name(f.get("name", ""))
+        and float(f.get("progress", 0)) >= 1
+    ]
+
+
+def find_common_root(paths):
+    clean_parts = []
+    for p in paths:
+        parts = Path(p).parts
+        if len(parts) > 1:
+            clean_parts.append(parts[:-1])
+
+    if not clean_parts:
+        return ""
+
+    common = list(clean_parts[0])
+    for parts in clean_parts[1:]:
+        i = 0
+        while i < min(len(common), len(parts)) and common[i] == parts[i]:
+            i += 1
+        common = common[:i]
+
+    return str(Path(*common)) if common else ""
+
+
+def resolve_video_source(settings, torrent, video_files):
+    """
+    Important: never scan the whole downloads folder.
+
+    We use qBittorrent's file list to determine the real source location.
+    Non-video torrents return no video_files and are skipped entirely.
+    """
+    save_path = normalize_source_path(torrent.get("save_path") or "")
+    content_path = normalize_source_path(torrent.get("content_path") or "")
+    name = torrent.get("name") or ""
+
+    video_names = [vf.get("name", "") for vf in video_files if vf.get("name")]
+    common_root = find_common_root(video_names)
+
+    candidates = []
+
+    if content_path:
+        candidates.append(Path(content_path))
+
+    if save_path and common_root:
+        candidates.append(Path(save_path) / common_root)
+
+    if save_path and name:
+        candidates.append(Path(save_path) / name)
+
+    if save_path and len(video_files) == 1:
+        candidates.append(Path(save_path) / video_names[0])
+
+    seen = set()
+    for candidate in candidates:
+        candidate = Path(candidate)
+
+        if candidate.is_file():
+            candidate = candidate.parent
+
+        if str(candidate).rstrip("/") == str(DOWNLOADS_ROOT).rstrip("/"):
+            continue
+
+        key = str(candidate)
+        if key in seen:
+            continue
+        seen.add(key)
+
+        if not candidate.exists():
+            continue
+
+        matched = []
+        for vf in video_files:
+            qbit_name = Path(vf.get("name", "")).name
+            possible = list(candidate.rglob(qbit_name))
+            matched.extend([p for p in possible if p.is_file() and is_video_name(p.name)])
+
+        if matched:
+            return candidate, sorted(set(matched), key=lambda p: str(p).lower())
+
+    return None, []
+
+
+def history_import_keys():
+    """
+    Backfill imported detection for items imported before qBittorrent hash tracking existed.
+    Uses recent link history titles and destinations as fuzzy match keys.
+    """
+    keys = set()
+
+    try:
+        history = read_history()
+    except Exception:
+        return keys
+
+    for item in history:
+        if item.get("type") == "error":
+            continue
+
+        for field in ("title", "destination"):
+            value = item.get(field, "")
+            if value:
+                keys.add(normalize_match_text(value))
+
+    return keys
+
+
+def imported_from_history(name: str, title: str, year: str, source_path: str, history_keys: set, media_type: str = "", season: str = "") -> bool:
+    normalized_source = normalize_match_text(source_path)
+    normalized_title = normalize_match_text(title)
+    normalized_name = normalize_match_text(name)
+    normalized_year_title = normalize_match_text(f"{title} {year}".strip())
+
+    season_num = str(season or "").zfill(2)
+    season_tokens = {
+        normalize_match_text(f"Season {season_num}"),
+        normalize_match_text(f"Season {int(season_num)}") if season_num.isdigit() else "",
+        normalize_match_text(f"S{season_num}"),
+    }
+
+    for key in history_keys:
+        if not key:
+            continue
+
+        if media_type == "tv":
+            title_match = (
+                normalized_title and normalized_title in key
+            ) or (
+                normalized_name and normalized_name in key
+            ) or (
+                normalized_source and normalized_source in key
+            )
+
+            season_match = any(token and token in key for token in season_tokens)
+
+            if title_match and season_match:
+                return True
+
+            continue
+
+        candidates = [normalized_source, normalized_year_title, normalized_name, normalized_title]
+        for candidate in candidates:
+            if candidate and (candidate in key or key in candidate):
+                return True
+
+    return False
+
+
+def qbit_completed_items(settings):
+    torrents = qbit_torrents(settings)
+    db = load_import_db()
+    history_keys = history_import_keys()
+    items = []
+
+    for torrent in torrents:
+        if float(torrent.get("progress", 0)) < 1:
+            continue
+
+        video_files = completed_video_files(settings, torrent)
+
+        # This is the main fix: no completed video files means no queue item.
+        if not video_files:
+            continue
+
+        source_path, videos = resolve_video_source(settings, torrent, video_files)
+        if not source_path or not videos:
+            continue
+
+        name = torrent.get("name", source_path.name)
+        media_type = guess_type(name, len(videos))
+        key = torrent.get("hash") or str(source_path)
+        title = strip_release_words(name)
+        year = detect_year(name)
+
+        season = detect_season(name)
+
+        imported = key in db or imported_from_history(
+            name=name,
+            title=title,
+            year=year,
+            source_path=str(source_path),
+            history_keys=history_keys,
+            media_type=media_type,
+            season=season,
+        )
+
+        items.append({
+            "name": name,
+            "path": str(source_path),
+            "video_count": len(videos),
+            "type": media_type,
+            "icon": "ðŸ“º" if media_type == "tv" else "ðŸŽ¬",
+            "type_label": "TV Show" if media_type == "tv" else "Movie",
+            "title": title,
+            "year": year,
+            "season": season,
+            "modified": "qBittorrent",
+            "source_kind": "torrent",
+            "source_key": key,
+            "imported": imported,
+            "hash": torrent.get("hash", ""),
+            "state": torrent.get("state", ""),
+            "ratio": round(float(torrent.get("ratio", 0)), 2),
+            "tracker": torrent.get("tracker", ""),
+            "category": torrent.get("category", ""),
+            "tags": torrent.get("tags", ""),
+            "size": int(torrent.get("size", 0)),
+        })
+
+    return sorted(items, key=lambda x: (x["imported"], x["name"].lower()))
+
+
+def test_qbit(settings):
+    torrents = qbit_torrents(settings)
+    completed = sum(1 for t in torrents if float(t.get("progress", 0)) >= 1)
+    return completed
+
+
+--- app/services/storage.py ---
+import json
+from app.config import HISTORY_FILE, IMPORT_DB_FILE, SETTINGS_FILE
+
+DEFAULT_SETTINGS = {
+    "qbittorrent_enabled": False,
+    "qbittorrent_url": "",
+    "qbittorrent_username": "",
+    "qbittorrent_password": "",
+    "tmdb_api_key": "",
+    "jellyfin_url": "",
+    "jellyfin_api_key": "",
+    "developer_mode": True,
+}
+
+def load_json(path, default):
+    if not path.exists():
+        return default.copy() if isinstance(default, dict) else default
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return default.copy() if isinstance(default, dict) else default
+
+def save_json(path, data):
+    path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+def load_settings():
+    data = DEFAULT_SETTINGS.copy()
+    data.update(load_json(SETTINGS_FILE, {}))
+    return data
+
+def save_settings(data):
+    cleaned = DEFAULT_SETTINGS.copy()
+    cleaned.update(data)
+    save_json(SETTINGS_FILE, cleaned)
+
+def load_import_db():
+    return load_json(IMPORT_DB_FILE, {})
+
+def save_import_db(db):
+    save_json(IMPORT_DB_FILE, db)
+
+def append_history(entry):
+    with HISTORY_FILE.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(entry) + "\n")
+
+def read_history(limit=30):
+    if not HISTORY_FILE.exists():
+        return []
+    lines = HISTORY_FILE.read_text(encoding="utf-8").splitlines()
+    out = []
+    for line in reversed(lines[-limit:]):
+        try:
+            out.append(json.loads(line))
+        except Exception:
+            pass
+    return out
+
+
+--- app/services/queue.py ---
+from pathlib import Path
+from datetime import datetime
+from app.config import DOWNLOADS_ROOT, IGNORE_NAMES
+from app.services.utils import find_videos, guess_type, strip_release_words, detect_year, detect_season
+from app.services.storage import load_import_db
+from app.services.qbittorrent import qbit_completed_items
+
+def folder_items():
+    folders = []
+    db = load_import_db()
+    if not DOWNLOADS_ROOT.exists():
+        return folders
+    for p in sorted(DOWNLOADS_ROOT.iterdir(), key=lambda x: x.stat().st_mtime if x.exists() else 0, reverse=True):
+        if not p.is_dir() or p.name.lower() in IGNORE_NAMES:
+            continue
+        videos = find_videos(p)
+        if not videos:
+            continue
+        media_type = guess_type(p.name, len(videos))
+        stat = p.stat()
+        key = str(p)
+        folders.append({
+            "name": p.name,
+            "path": str(p),
+            "video_count": len(videos),
+            "type": media_type,
+            "icon": "ðŸ“º" if media_type == "tv" else "ðŸŽ¬",
+            "type_label": "TV Show" if media_type == "tv" else "Movie",
+            "title": strip_release_words(p.name),
+            "year": detect_year(p.name),
+            "season": detect_season(p.name),
+            "modified": datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M"),
+            "source_kind": "folder",
+            "source_key": key,
+            "imported": key in db,
+            "hash": "",
+            "state": "",
+            "ratio": "",
+        })
+    return folders
+
+def queue_items(settings):
+    if settings.get("qbittorrent_enabled"):
+        try:
+            items = qbit_completed_items(settings)
+            return items, "qBittorrent", None
+        except Exception as e:
+            return folder_items(), "Folders", f"qBittorrent error: {e}"
+    return folder_items(), "Folders", None
+

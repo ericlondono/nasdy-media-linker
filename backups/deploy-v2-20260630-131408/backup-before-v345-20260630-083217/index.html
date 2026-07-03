@@ -1,0 +1,322 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{ app_name }} {{ version }}</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <main class="shell">
+    <section class="hero">
+      <div>
+        <h1>{{ app_name }}</h1>
+        <p>Hard-link completed media into Jellyfin-friendly folders while qBittorrent keeps seeding.</p>
+      </div>
+
+      <nav class="hero-actions">
+        <a class="navlink" href="/settings">Settings</a>
+        {% if settings.developer_mode %}
+          <a class="navlink" href="/dev">Dev</a>
+        {% endif %}
+        <span class="badge">{{ version }}</span>
+        <span class="pill {% if tmdb_enabled %}good{% endif %}">
+          {% if tmdb_enabled %}TMDb on{% else %}TMDb off{% endif %}
+        </span>
+        <span class="pill {% if jellyfin_enabled %}good{% endif %}">
+          {% if jellyfin_enabled %}Jellyfin on{% else %}Jellyfin off{% endif %}
+        </span>
+        <span class="pill {% if qbittorrent_enabled %}good{% endif %}">
+          {% if qbittorrent_enabled %}qBit on{% else %}Folder mode{% endif %}
+        </span>
+      </nav>
+    </section>
+
+    {% if queue_error %}
+      <div class="alert error">{{ queue_error }}</div>
+    {% endif %}
+
+    <section class="layout">
+      <aside class="card">
+        <div class="card-head">
+          <div>
+            <h2>{% if qbittorrent_enabled %}Completed Torrents{% else %}Folders{% endif %}</h2>
+            <p class="section-subtitle">
+              {% if qbittorrent_enabled %}
+                Completed video torrents ready to import.
+              {% else %}
+                Download folders ready to scan.
+              {% endif %}
+            </p>
+          </div>
+          <span>{{ items|length }} total</span>
+        </div>
+
+        {% if qbittorrent_enabled %}
+          {% set ready_count = namespace(value=0) %}
+          {% set imported_count = namespace(value=0) %}
+          {% for item in items %}
+            {% if item.imported %}
+              {% set imported_count.value = imported_count.value + 1 %}
+            {% else %}
+              {% set ready_count.value = ready_count.value + 1 %}
+            {% endif %}
+          {% endfor %}
+
+          <div class="queue-tabs" role="tablist" aria-label="Queue filters">
+            <button class="queue-tab active" type="button" data-filter="ready">
+              Ready <span>{{ ready_count.value }}</span>
+            </button>
+            <button class="queue-tab" type="button" data-filter="imported">
+              Imported <span>{{ imported_count.value }}</span>
+            </button>
+            <button class="queue-tab" type="button" data-filter="all">
+              All <span>{{ items|length }}</span>
+            </button>
+          </div>
+        {% endif %}
+
+        <input id="queueSearch" class="search" placeholder="Search queue..." autocomplete="off">
+
+        <div class="folder-list" id="queueList">
+          {% if items %}
+            {% for item in items %}
+              <button
+                class="folder torrent-card {% if item.imported %}imported{% endif %}"
+                type="button"
+                data-source="{{ item.path }}"
+                data-source-key="{{ item.source_key if item.source_key else item.path }}"
+                data-title="{{ item.title }}"
+                data-year="{{ item.year }}"
+                data-season="{{ item.season }}"
+                data-type="{{ item.type }}"
+                data-imported="{% if item.imported %}true{% else %}false{% endif %}"
+              >
+                <span class="torrent-topline">
+                  <span class="torrent-icon">{{ item.icon }}</span>
+                  <span class="torrent-heading">
+                    <span class="folder-title">{{ item.title if item.title else item.name }}</span>
+                    {% if item.year %}
+                      <span class="year-pill">{{ item.year }}</span>
+                    {% endif %}
+                  </span>
+                </span>
+
+                <span class="release-name">{{ item.name }}</span>
+
+                <span class="torrent-status-row">
+                  <span class="status-chip {% if item.imported %}imported{% else %}ready{% endif %}">
+                    {% if item.imported %}Imported{% else %}Ready{% endif %}
+                  </span>
+                  <span class="mini-pill">{{ item.type_label }}</span>
+                  <span class="mini-pill">{{ item.video_count }} video{% if item.video_count != 1 %}s{% endif %}</span>
+                </span>
+
+                {% if qbittorrent_enabled %}
+                  <span class="metric-grid">
+                    <span class="metric">
+                      <span class="metric-label">Ratio</span>
+                      <span class="metric-value">{{ item.ratio }}</span>
+                    </span>
+                    <span class="metric">
+                      <span class="metric-label">State</span>
+                      <span class="metric-value">{{ item.state if item.state else "—" }}</span>
+                    </span>
+                    {% if item.category %}
+                      <span class="metric wide">
+                        <span class="metric-label">Category</span>
+                        <span class="metric-value">{{ item.category }}</span>
+                      </span>
+                    {% endif %}
+                  </span>
+                {% else %}
+                  <span class="folder-meta">{{ item.modified }}</span>
+                {% endif %}
+              </button>
+            {% endfor %}
+          {% else %}
+            <p>No completed video items found.</p>
+          {% endif %}
+        </div>
+
+        <div id="queueEmpty" class="queue-empty hidden">
+          No items match this filter.
+        </div>
+      </aside>
+
+      <section class="card">
+        <h2>Import</h2>
+
+        <form method="post" action="/organize">
+          <input type="hidden" id="source" name="source">
+          <input type="hidden" id="sourceKey" name="source_key">
+
+          <label>Media Type</label>
+          <div class="segmented">
+            <label>
+              <input type="radio" name="media_type" value="tv" checked>
+              <span>📺 TV Show</span>
+            </label>
+            <label>
+              <input type="radio" name="media_type" value="movie">
+              <span>🎬 Movie</span>
+            </label>
+          </div>
+
+          <label for="title">Title</label>
+          <input id="title" name="title" autocomplete="off">
+
+          <div class="grid">
+            <div>
+              <label for="year">Year</label>
+              <input id="year" name="year" placeholder="optional" autocomplete="off">
+            </div>
+        <div>
+            <label for="imdb_id">IMDb ID</label>
+            <input id="imdb_id" name="imdb_id" placeholder="optional, e.g. tt13056008" autocomplete="off">
+        </div>
+            <div id="seasonWrap">
+              <label for="season">Season</label>
+              <input id="season" name="season" value="01" autocomplete="off">
+            </div>
+          </div>
+
+          <label class="checkline">
+            <input type="checkbox" name="refresh_jellyfin">
+            Refresh Jellyfin after link
+          </label>
+
+          <div id="metadata" class="metadata hidden"></div>
+          <div id="importedBox" class="imported-box hidden"></div>
+          <div id="warning" class="warning"></div>
+
+          <div class="actions">
+            <button id="previewBtn" class="secondary" type="button">Preview</button>
+            <button type="submit">Create Hard Links</button>
+            <button id="markImportedBtn" class="secondary" type="button">✓ Mark Imported</button>
+            {% if settings.developer_mode %}
+              <button id="unmarkImportedBtn" class="danger hidden" type="button">Unmark Imported</button>
+            {% endif %}
+          </div>
+        </form>
+
+        <h3>Dry Run Preview</h3>
+        <div id="preview" class="preview-box">
+          <div class="empty-preview">Select a queue item to begin.</div>
+        </div>
+
+        {% if settings.developer_mode %}
+          <h3>Link Diagnostics</h3>
+          <pre id="diagnostics" class="diag-box">Preview an item to see path diagnostics.</pre>
+        {% endif %}
+      </section>
+
+      <aside class="card">
+        <h2>Import History</h2>
+        <div class="history-tabs">
+          <button class="history-tab active" type="button" data-history-filter="success">Success</button>
+          <button class="history-tab" type="button" data-history-filter="error">Errors</button>
+          <button class="history-tab" type="button" data-history-filter="all">All</button>
+        </div>
+
+        <div class="history">
+          {% if history %}
+            {% for item in history %}
+              <div class="history-item {% if item.type == 'error' %}bad{% endif %}" data-history-type="{% if item.type == 'error' %}error{% else %}success{% endif %}">
+                <strong>
+                  {% if item.type == 'tv' %}📺{% elif item.type == 'movie' %}🎬{% else %}⚠️{% endif %}
+                  {{ item.title }}
+                </strong>
+                <span>{{ item.time }}</span>
+                {% if item.type == 'error' %}
+                  <small>{{ item.error }}</small>
+                {% else %}
+                  <small>{{ item.count }} link(s) → {{ item.destination }}</small>
+                {% endif %}
+              </div>
+            {% endfor %}
+          {% else %}
+            <p>No hard links created yet.</p>
+          {% endif %}
+        </div>
+      </aside>
+    </section>
+  </main>
+
+  <script src="/static/app.js"></script>
+  <script>
+    (function () {
+      const tabs = document.querySelectorAll(".queue-tab");
+      const cards = document.querySelectorAll(".torrent-card");
+      const search = document.querySelector("#queueSearch");
+      const empty = document.querySelector("#queueEmpty");
+      let activeFilter = "ready";
+
+      function cardMatchesFilter(card) {
+        const imported = card.dataset.imported === "true";
+        if (activeFilter === "ready") return !imported;
+        if (activeFilter === "imported") return imported;
+        return true;
+      }
+
+      function cardMatchesSearch(card) {
+        if (!search) return true;
+        const term = search.value.trim().toLowerCase();
+        if (!term) return true;
+        return card.textContent.toLowerCase().includes(term);
+      }
+
+      function applyFilters() {
+        let visibleCount = 0;
+
+        cards.forEach(card => {
+          const visible = cardMatchesFilter(card) && cardMatchesSearch(card);
+          card.classList.toggle("hidden", !visible);
+          if (visible) visibleCount += 1;
+        });
+
+        if (empty) empty.classList.toggle("hidden", visibleCount !== 0);
+      }
+
+      tabs.forEach(tab => {
+        tab.addEventListener("click", () => {
+          tabs.forEach(t => t.classList.remove("active"));
+          tab.classList.add("active");
+          activeFilter = tab.dataset.filter || "ready";
+          applyFilters();
+        });
+      });
+
+      if (search) search.addEventListener("input", applyFilters);
+      applyFilters();
+    })();
+  </script>
+
+<script>
+document.addEventListener("DOMContentLoaded", () => {
+  const tabs = document.querySelectorAll(".history-tab");
+  const items = document.querySelectorAll(".history-item");
+
+  function applyHistoryFilter(filter) {
+    items.forEach(item => {
+      const type = item.dataset.historyType || "success";
+      item.classList.toggle("hidden", !(filter === "all" || filter === type));
+    });
+  }
+
+  tabs.forEach(tab => {
+    tab.addEventListener("click", () => {
+      tabs.forEach(t => t.classList.remove("active"));
+      tab.classList.add("active");
+      applyHistoryFilter(tab.dataset.historyFilter || "success");
+    });
+  });
+
+  applyHistoryFilter("success");
+});
+</script>
+\n</body>
+</html>
+
+
+

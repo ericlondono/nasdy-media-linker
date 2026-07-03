@@ -1,0 +1,3033 @@
+﻿===== FILE: app\config.py =====
+import os
+from pathlib import Path
+
+APP_NAME = "NASDY Media Linker"
+APP_VERSION = "v3.4.4"
+
+DOWNLOADS_ROOT = Path(os.environ.get("DOWNLOADS_ROOT", "/downloads"))
+MOVIES_ROOT = Path(os.environ.get("MOVIES_ROOT", "/media/Movies"))
+TV_ROOT = Path(os.environ.get("TV_ROOT", "/media/TV Shows"))
+DATA_ROOT = Path(os.environ.get("DATA_ROOT", "/data"))
+
+HOST_DOWNLOADS_ROOT = os.environ.get("HOST_DOWNLOADS_ROOT", "/mnt/user/NASDY/downloads")
+HOST_MEDIA_ROOT = os.environ.get("HOST_MEDIA_ROOT", "/mnt/user/NASDY/media")
+HOST_MNT_ROOT = Path(os.environ.get("HOST_MNT_ROOT", "/host_mnt"))
+
+VIDEO_EXTENSIONS = {".mkv", ".mp4", ".avi", ".mov", ".m4v", ".wmv"}
+
+IGNORE_NAMES = {
+    "audiobooks", "books", "print", "movies", "tv shows", "tv", "music",
+    "media organizer", "lost+found", "media linker"
+}
+
+QUALITY_WORDS = [
+    "2160p","1080p","720p","480p","webrip","web-rip","web-dl","webdl","bluray","blu-ray","brrip",
+    "hdrip","dvdrip","uhd","truehd","remux","x264","x265","h264","h265","hevc","av1","flac","aac",
+    "truehd","atmos","dts","dts-hd","ma","hdr","hdr10","dv","dolby","vision","proper","repack",
+    "extended","unrated","directors","director","cut","amzn","amazon","nf","netflix","hulu","max",
+    "lama","trolluhd","playweb","ddp","dd5","5.1","7.1","10bit","8bit","yts","rarbg", "eac3", "siqma"
+]
+
+DATA_ROOT.mkdir(parents=True, exist_ok=True)
+
+HISTORY_FILE = DATA_ROOT / "history.jsonl"
+IMPORT_DB_FILE = DATA_ROOT / "imports.json"
+SETTINGS_FILE = DATA_ROOT / "settings.json"
+LOG_FILE = DATA_ROOT / "media-linker.log"
+
+
+
+
+
+
+===== FILE: app\main.py =====
+from datetime import datetime
+from pathlib import Path
+from typing import Optional
+
+from fastapi import FastAPI, Request, Form
+from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
+
+from app.config import APP_NAME, APP_VERSION
+from app.services.storage import load_settings, save_settings, load_import_db, save_import_db, append_history, read_history
+from app.services.queue import queue_items
+from app.services.linker import build_plan, create_hard_links, diagnostic_for_link
+from app.services.tmdb import tmdb_search
+from app.services.jellyfin import jellyfin_refresh
+from app.services.qbittorrent import normalize_source_path
+from app.services.qbittorrent import test_qbit
+from app.services.library import find_library_match
+from app.services.logger import read_log, log
+
+app = FastAPI(title=APP_NAME)
+app.mount("/static", StaticFiles(directory="app/static"), name="static")
+templates = Jinja2Templates(directory="app/templates")
+
+
+def history_counts(history):
+    success = sum(1 for h in history if h.get("status") == "success")
+    error = sum(1 for h in history if h.get("status") == "error" or h.get("type") == "error")
+    imported = success
+    return {
+        "success_count": {"value": success},
+        "error_count": {"value": error},
+        "imported_count": {"value": imported},
+    }
+
+
+def import_alias_keys(source_key, source):
+    keys = {
+        source_key or "",
+        source or "",
+        normalize_source_path(source or ""),
+        str(Path(source)) if source else "",
+    }
+    return {str(key or "").strip() for key in keys if str(key or "").strip()}
+
+
+def save_import_aliases(db, source_key, source, entry):
+    for key in import_alias_keys(source_key, source):
+        db[key] = entry
+    return db
+
+
+def remove_import_aliases(db, source_key, source):
+    targets = import_alias_keys(source_key, source)
+    normalized_targets = {normalize_source_path(k) for k in targets if k}
+
+    for key in list(db.keys()):
+        key_norm = normalize_source_path(key)
+        entry = db.get(key) or {}
+        entry_source = str(entry.get("source", "")) if isinstance(entry, dict) else ""
+        entry_source_key = str(entry.get("source_key", "")) if isinstance(entry, dict) else ""
+        entry_values = {
+            entry_source,
+            entry_source_key,
+            normalize_source_path(entry_source),
+            normalize_source_path(entry_source_key),
+        }
+
+        if key in targets or key_norm in normalized_targets or entry_values.intersection(targets) or entry_values.intersection(normalized_targets):
+            db.pop(key, None)
+
+    return db
+
+
+def find_import_record(db, source_key, source):
+    candidates = import_alias_keys(source_key, source)
+    for key in candidates:
+        if key in db:
+            return db.get(key)
+
+    normalized_candidates = {normalize_source_path(k) for k in candidates}
+    for key, entry in (db or {}).items():
+        if normalize_source_path(key) in normalized_candidates:
+            return entry
+        if isinstance(entry, dict):
+            entry_source = str(entry.get("source", ""))
+            entry_source_key = str(entry.get("source_key", ""))
+            if entry_source in candidates or entry_source_key in candidates:
+                return entry
+            if normalize_source_path(entry_source) in normalized_candidates:
+                return entry
+            if normalize_source_path(entry_source_key) in normalized_candidates:
+                return entry
+    return None
+
+
+@app.get("/", response_class=HTMLResponse)
+def index(request: Request):
+    settings = load_settings()
+    items, source_label, queue_error = queue_items(settings)
+    history = read_history()
+    counts = history_counts(history)
+
+    return templates.TemplateResponse("index.html", {
+        "request": request,
+        "app_name": APP_NAME,
+        "version": APP_VERSION,
+        "items": items,
+        "source_label": source_label,
+        "queue_error": queue_error,
+        "history": history,
+        "settings": settings,
+        "tmdb_enabled": bool(settings.get("tmdb_api_key")),
+        "jellyfin_enabled": bool(settings.get("jellyfin_url") and settings.get("jellyfin_api_key")),
+        "qbittorrent_enabled": bool(settings.get("qbittorrent_enabled")),
+        **counts,
+    })
+
+
+@app.get("/settings", response_class=HTMLResponse)
+def settings_page(request: Request):
+    return templates.TemplateResponse("settings.html", {
+        "request": request,
+        "app_name": APP_NAME,
+        "version": APP_VERSION,
+        "settings": load_settings(),
+    })
+
+
+@app.post("/settings")
+def save_settings_route(
+    qbittorrent_enabled: Optional[str] = Form(None),
+    qbittorrent_url: str = Form(""),
+    qbittorrent_username: str = Form(""),
+    qbittorrent_password: str = Form(""),
+    tmdb_api_key: str = Form(""),
+    jellyfin_url: str = Form(""),
+    jellyfin_api_key: str = Form(""),
+    developer_mode: Optional[str] = Form(None),
+):
+    save_settings({
+        "qbittorrent_enabled": bool(qbittorrent_enabled),
+        "qbittorrent_url": qbittorrent_url.strip().rstrip("/"),
+        "qbittorrent_username": qbittorrent_username.strip(),
+        "qbittorrent_password": qbittorrent_password,
+        "tmdb_api_key": tmdb_api_key.strip(),
+        "jellyfin_url": jellyfin_url.strip().rstrip("/"),
+        "jellyfin_api_key": jellyfin_api_key.strip(),
+        "developer_mode": bool(developer_mode),
+    })
+    return RedirectResponse("/settings?saved=1", status_code=303)
+
+
+@app.post("/api/qbit/test")
+async def api_qbit_test(request: Request):
+    data = await request.json()
+    settings = load_settings()
+    settings.update(data)
+    try:
+        completed = test_qbit(settings)
+        return JSONResponse({"ok": True, "message": f"Connected. {completed} completed torrent(s) found."})
+    except Exception as e:
+        return JSONResponse({"ok": False, "message": str(e)})
+
+
+@app.post("/api/preview")
+async def api_preview(request: Request):
+    data = await request.json()
+    try:
+        media_type = data.get("media_type", "tv")
+        source = data.get("source", "")
+        title = data.get("title", "")
+        year = data.get("year", "")
+        imdb_id = data.get("imdb_id", "").strip()
+        season = data.get("season", "01")
+
+        dest_dir, items = build_plan(media_type, source, title, year, season)
+        settings = load_settings()
+
+        meta = tmdb_search(settings, media_type, title, year) or {}
+        library_match = find_library_match(media_type, title, year, season)
+
+        db = load_import_db()
+        source_key = data.get("source_key") or source or ""
+        imported = find_import_record(db, source_key, source)
+
+        diagnostics = []
+        for i in items:
+            diagnostics.append(diagnostic_for_link(Path(i["src"]), Path(i["dst"])))
+
+        return JSONResponse({
+            "ok": True,
+            "destination": str(dest_dir),
+            "metadata": {
+                **meta,
+                "imdb_id": imdb_id,
+            },
+            "library_match": library_match,
+            "imported": imported,
+            "diagnostics": diagnostics,
+            "items": [{
+                "src": str(i["src"]),
+                "dst": str(i["dst"]),
+                "new_name": i["new_name"],
+                "exists": Path(i["dst"]).exists()
+            } for i in items],
+        })
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e)})
+
+
+@app.post("/api/imports/mark")
+async def api_imports_mark(request: Request):
+    data = await request.json()
+    try:
+        media_type = data.get("media_type", "tv")
+        source = data.get("source", "")
+        source_key = data.get("source_key") or source or ""
+        title = data.get("title", "")
+        year = data.get("year", "")
+        imdb_id = data.get("imdb_id", "").strip()
+        season = data.get("season", "01")
+
+        if not source:
+            return JSONResponse({"ok": False, "error": "No source item selected."})
+        if not title:
+            return JSONResponse({"ok": False, "error": "Title is required before marking imported."})
+
+        destination = ""
+        try:
+            dest_dir, _ = build_plan(media_type, source, title, year, season)
+            destination = str(dest_dir)
+        except Exception as plan_error:
+            log(f"WARN manual mark could not build destination preview: {plan_error}")
+
+        entry = {
+            "time": datetime.now().strftime("%Y-%m-%d %H:%M"),
+            "type": media_type,
+            "title": title,
+            "year": year,
+            "imdb_id": imdb_id,
+            "season": season if media_type == "tv" else "",
+            "count": 0,
+            "destination": destination,
+            "jellyfin": "",
+            "status": "success",
+            "import_type": "manual",
+            "source": source,
+            "source_key": source_key,
+            "diagnostics": [],
+        }
+
+        db = load_import_db()
+        db = save_import_aliases(db, source_key, source, entry)
+        save_import_db(db)
+
+        log(f"Manual import mark: {title} ({year}) source={source} source_key={source_key}")
+        return JSONResponse({"ok": True, "entry": entry})
+    except Exception as e:
+        log(f"ERROR manual import mark: {e}")
+        return JSONResponse({"ok": False, "error": str(e)})
+
+
+@app.post("/api/imports/unmark")
+async def api_imports_unmark(request: Request):
+    data = await request.json()
+    try:
+        source = data.get("source", "")
+        source_key = data.get("source_key") or source or ""
+        if not source and not source_key:
+            return JSONResponse({"ok": False, "error": "No import record selected."})
+
+        db = load_import_db()
+        before = len(db)
+        db = remove_import_aliases(db, source_key, source)
+        removed = before - len(db)
+        save_import_db(db)
+
+        log(f"Manual import unmark: removed {removed} import alias(es) source={source} source_key={source_key}")
+        return JSONResponse({"ok": True, "removed": removed})
+    except Exception as e:
+        log(f"ERROR manual import unmark: {e}")
+        return JSONResponse({"ok": False, "error": str(e)})
+
+
+@app.post("/organize")
+def organize(
+    media_type: str = Form(...),
+    source: str = Form(...),
+    source_key: str = Form(""),
+    title: str = Form(...),
+    year: str = Form(""),
+    imdb_id: str = Form(""),
+    season: str = Form("01"),
+    refresh_jellyfin: Optional[str] = Form(None),
+):
+    try:
+        settings = load_settings()
+        dest_dir, items = build_plan(media_type, source, title, year, season)
+        created, diagnostics = create_hard_links(items)
+
+        jf_msg = ""
+        if refresh_jellyfin:
+            _, jf_msg = jellyfin_refresh(settings)
+
+        entry = {
+            "time": datetime.now().strftime("%Y-%m-%d %H:%M"),
+            "type": media_type,
+            "title": title,
+            "year": year,
+            "imdb_id": imdb_id.strip(),
+            "season": season if media_type == "tv" else "",
+            "count": len(created),
+            "destination": str(dest_dir),
+            "jellyfin": jf_msg,
+            "status": "success",
+            "import_type": "linked",
+            "source": source,
+            "source_key": source_key,
+            "diagnostics": diagnostics,
+        }
+
+        append_history(entry)
+
+        db = load_import_db()
+        db = save_import_aliases(db, source_key, source, entry)
+        save_import_db(db)
+
+        return RedirectResponse("/", status_code=303)
+    except Exception as e:
+        log(f"ERROR organize: {e}")
+        append_history({
+            "time": datetime.now().strftime("%Y-%m-%d %H:%M"),
+            "type": "error",
+            "title": title,
+            "error": str(e),
+            "status": "error",
+            "source": source,
+            "source_key": source_key,
+        })
+        return RedirectResponse("/", status_code=303)
+
+
+@app.get("/dev", response_class=HTMLResponse)
+def dev_page(request: Request):
+    settings = load_settings()
+    return templates.TemplateResponse("dev.html", {
+        "request": request,
+        "app_name": APP_NAME,
+        "version": APP_VERSION,
+        "settings": settings,
+        "log": read_log(),
+    })
+
+
+@app.post("/api/jellyfin/refresh")
+def api_jellyfin_refresh():
+    ok, msg = jellyfin_refresh(load_settings())
+    return JSONResponse({"ok": ok, "message": msg})
+
+
+@app.get("/health")
+def health():
+    return {
+        "ok": True,
+        "name": APP_NAME,
+        "version": APP_VERSION,
+    }
+
+
+
+===== FILE: app\__init__.py =====
+
+
+===== FILE: app\services\jellyfin.py =====
+import requests
+
+def jellyfin_refresh(settings):
+    url = settings.get("jellyfin_url", "").rstrip("/")
+    api_key = settings.get("jellyfin_api_key", "")
+    if not url or not api_key:
+        return False, "Jellyfin refresh not configured."
+    try:
+        r = requests.post(f"{url}/Library/Refresh", headers={"X-Emby-Token": api_key}, timeout=8)
+        if r.status_code in (200, 204):
+            return True, "Jellyfin scan requested."
+        return False, f"Jellyfin returned HTTP {r.status_code}."
+    except Exception as e:
+        return False, str(e)
+
+
+
+===== FILE: app\services\library.py =====
+from pathlib import Path
+import re
+
+from app.config import MOVIES_ROOT, TV_ROOT, VIDEO_EXTENSIONS
+
+
+def normalize_text(value: str) -> str:
+    return "".join(ch.lower() for ch in str(value or "") if ch.isalnum())
+
+
+def clean_folder_title(folder_name: str) -> str:
+    text = str(folder_name or "")
+    text = re.sub(r"\((19\d{2}|20\d{2})\)", " ", text)
+    text = re.sub(r"\[(19\d{2}|20\d{2})\]", " ", text)
+    text = text.replace(".", " ").replace("_", " ")
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def extract_year(value: str) -> str:
+    match = re.search(r"\b(19\d{2}|20\d{2})\b", str(value or ""))
+    return match.group(1) if match else ""
+
+
+def video_count(folder: Path) -> int:
+    if not folder.exists():
+        return 0
+    return sum(
+        1 for p in folder.rglob("*")
+        if p.is_file() and p.suffix.lower() in VIDEO_EXTENSIONS
+    )
+
+
+def folder_score(query_title: str, query_year: str, folder: Path) -> int:
+    folder_name = folder.name
+    folder_title = clean_folder_title(folder_name)
+    folder_year = extract_year(folder_name)
+
+    query_norm = normalize_text(query_title)
+    folder_norm = normalize_text(folder_title)
+    folder_full_norm = normalize_text(folder_name)
+
+    if not query_norm:
+        return 0
+
+    score = 0
+
+    if query_norm == folder_norm:
+        score += 100
+    elif query_norm in folder_norm or folder_norm in query_norm:
+        score += 75
+    elif query_norm in folder_full_norm:
+        score += 60
+
+    if query_year and folder_year:
+        if query_year == folder_year:
+            score += 40
+        else:
+            score -= 30
+    elif query_year and query_year in folder_name:
+        score += 25
+
+    return score
+
+
+def season_folder_candidates(show_folder: Path, season: str):
+    season_num = str(season or "01").zfill(2)
+    season_int = int(season_num)
+
+    names = [
+        f"Season {season_num}",
+        f"Season {season_int}",
+        f"S{season_num}",
+        f"Series {season_num}",
+        f"Series {season_int}",
+    ]
+
+    return [show_folder / name for name in names]
+
+
+def existing_episode_numbers(season_folder: Path):
+    episodes = set()
+    if not season_folder.exists():
+        return []
+
+    for file in season_folder.rglob("*"):
+        if not file.is_file() or file.suffix.lower() not in VIDEO_EXTENSIONS:
+            continue
+
+        text = file.name
+        match = re.search(r"\bS\d{1,2}E(\d{1,3})\b", text, re.I)
+        if match:
+            episodes.add(int(match.group(1)))
+            continue
+
+        match = re.search(r"\b\d{1,2}x(\d{1,3})\b", text, re.I)
+        if match:
+            episodes.add(int(match.group(1)))
+
+    return sorted(episodes)
+
+
+def find_movie_match(title: str, year: str = ""):
+    if not MOVIES_ROOT.exists():
+        return None
+
+    best = None
+    for folder in MOVIES_ROOT.iterdir():
+        if not folder.is_dir():
+            continue
+
+        score = folder_score(title, year, folder)
+        if score <= 0:
+            continue
+
+        current = {
+            "kind": "movie",
+            "title": folder.name,
+            "path": str(folder),
+            "score": score,
+            "year": extract_year(folder.name),
+            "video_count": video_count(folder),
+        }
+
+        if best is None or current["score"] > best["score"]:
+            best = current
+
+    if best and best["score"] >= 60:
+        best["confidence"] = "high" if best["score"] >= 100 else "medium"
+        return best
+
+    return None
+
+
+def find_tv_match(title: str, season: str = "01"):
+    if not TV_ROOT.exists():
+        return None
+
+    best = None
+    for show_folder in TV_ROOT.iterdir():
+        if not show_folder.is_dir():
+            continue
+
+        score = folder_score(title, "", show_folder)
+        if score <= 0:
+            continue
+
+        found_season_folder = None
+        for candidate in season_folder_candidates(show_folder, season):
+            if candidate.exists():
+                found_season_folder = candidate
+                break
+
+        current = {
+            "kind": "tv",
+            "title": show_folder.name,
+            "path": str(show_folder),
+            "score": score,
+            "season": str(season or "01").zfill(2),
+            "season_exists": bool(found_season_folder),
+            "season_path": str(found_season_folder) if found_season_folder else "",
+            "existing_episodes": existing_episode_numbers(found_season_folder) if found_season_folder else [],
+        }
+
+        if best is None or current["score"] > best["score"]:
+            best = current
+
+    if best and best["score"] >= 60:
+        best["confidence"] = "high" if best["score"] >= 100 else "medium"
+        return best
+
+    return None
+
+
+def find_library_match(media_type: str, title: str, year: str = "", season: str = "01"):
+    if media_type == "movie":
+        return find_movie_match(title, year)
+
+    return find_tv_match(title, season)
+
+
+
+===== FILE: app\services\linker.py =====
+import os
+from pathlib import Path
+from app.config import DOWNLOADS_ROOT, MOVIES_ROOT, TV_ROOT, HOST_MNT_ROOT
+from app.services.utils import find_videos, detect_episode, safe_name
+from app.services.logger import log
+
+def build_plan(media_type: str, source: str, title: str, year: str, season: str):
+    source_path = Path(source)
+    videos = find_videos(source_path)
+    title = title.strip()
+    year = year.strip()
+    season = season.strip() or "01"
+
+    if not source_path.exists():
+        raise ValueError(f"Source folder does not exist: {source_path}")
+    if not title:
+        raise ValueError("Title is required.")
+    if not videos:
+        raise ValueError("No video files found.")
+
+    items = []
+    if media_type == "tv":
+        season = f"{int(season):02d}"
+        display = f"{title} ({year})" if year else title
+        dest_dir = TV_ROOT / safe_name(display) / f"Season {season}"
+        fallback = 1
+        for src in videos:
+            ep = detect_episode(src.name)
+            if not ep:
+                ep = f"{fallback:02d}"
+                fallback += 1
+            new_name = safe_name(f"{display} - S{season}E{ep}{src.suffix.lower()}")
+            items.append({"src": src, "dst": dest_dir / new_name, "new_name": new_name, "episode": ep})
+    else:
+        display = f"{title} ({year})" if year else title
+        dest_dir = MOVIES_ROOT / safe_name(display)
+        if len(videos) == 1:
+            src = videos[0]
+            new_name = safe_name(f"{display}{src.suffix.lower()}")
+            items.append({"src": src, "dst": dest_dir / new_name, "new_name": new_name})
+        else:
+            for idx, src in enumerate(videos, start=1):
+                new_name = safe_name(f"{display} - Part {idx}{src.suffix.lower()}")
+                items.append({"src": src, "dst": dest_dir / new_name, "new_name": new_name})
+    return dest_dir, items
+
+def container_to_host_user_path(container_path: Path) -> Path:
+    """
+    Convert container paths to the host /mnt/user path through /host_mnt mount:
+    /downloads/foo -> /host_mnt/user/NASDY/downloads/foo
+    /media/Movies/foo -> /host_mnt/user/NASDY/media/Movies/foo
+    """
+    p = Path(container_path)
+    s = str(p)
+    if s.startswith("/downloads"):
+        rel = s.removeprefix("/downloads").lstrip("/")
+        return HOST_MNT_ROOT / "user" / "NASDY" / "downloads" / rel
+    if s.startswith("/media"):
+        rel = s.removeprefix("/media").lstrip("/")
+        return HOST_MNT_ROOT / "user" / "NASDY" / "media" / rel
+    return p
+
+def resolve_real_host_path(container_path: Path) -> Path:
+    """
+    Resolve a /mnt/user FUSE path to a real /mnt/cache or /mnt/diskX path as exposed inside container.
+    If the path exists as a file, search by relative path first.
+    """
+    user_path = container_to_host_user_path(container_path)
+    s = str(user_path)
+
+    # Convert /host_mnt/user/NASDY/... to relative NASDY/...
+    marker = "/host_mnt/user/"
+    if s.startswith(marker):
+        rel = s.removeprefix(marker)
+    else:
+        return user_path
+
+    candidates = []
+    for root in [HOST_MNT_ROOT / "cache"] + sorted(HOST_MNT_ROOT.glob("disk*")):
+        candidates.append(root / rel)
+
+    for c in candidates:
+        if c.exists():
+            return c
+
+    # For destination that does not exist yet, pick same disk as source later.
+    return user_path
+
+def matching_dest_on_source_disk(src_real: Path, dst_container: Path) -> Path:
+    """
+    Given real source path (/host_mnt/cache/NASDY/downloads/...) and destination container path
+    (/media/Movies/...), create matching destination on same root:
+    /host_mnt/cache/NASDY/media/Movies/...
+    """
+    src_parts = src_real.parts
+    # /host_mnt/cache/NASDY/... => root = /host_mnt/cache
+    if len(src_parts) >= 3 and src_parts[1] == "host_mnt":
+        disk_root = Path("/") / src_parts[1] / src_parts[2]
+    else:
+        return container_to_host_user_path(dst_container)
+
+    dst_s = str(dst_container)
+    if dst_s.startswith("/media"):
+        rel = dst_s.removeprefix("/media").lstrip("/")
+        return disk_root / "NASDY" / "media" / rel
+    return container_to_host_user_path(dst_container)
+
+def stat_device(path: Path):
+    try:
+        st = os.stat(path if path.exists() else path.parent)
+        return st.st_dev
+    except Exception:
+        return None
+
+def diagnostic_for_link(src_container: Path, dst_container: Path):
+    src_real = resolve_real_host_path(src_container)
+    dst_real = matching_dest_on_source_disk(src_real, dst_container)
+    return {
+        "src_container": str(src_container),
+        "dst_container": str(dst_container),
+        "src_real": str(src_real),
+        "dst_real": str(dst_real),
+        "src_exists": src_real.exists(),
+        "dst_exists": dst_real.exists(),
+        "src_device": stat_device(src_real),
+        "dst_parent_device": stat_device(dst_real.parent),
+        "same_device": stat_device(src_real) == stat_device(dst_real.parent),
+    }
+
+def create_hard_links(items):
+    created = []
+    diagnostics = []
+
+    for item in items:
+        src_container = Path(item["src"])
+        dst_container = Path(item["dst"])
+        diag = diagnostic_for_link(src_container, dst_container)
+        diagnostics.append(diag)
+
+        src_real = Path(diag["src_real"])
+        dst_real = Path(diag["dst_real"])
+
+        log(f"LINK DIAG: {diag}")
+
+        if not src_real.exists():
+            raise FileNotFoundError(f"Resolved source does not exist: {src_real}")
+        if dst_real.exists():
+            raise FileExistsError(f"Already exists: {dst_real}")
+
+        dst_real.parent.mkdir(parents=True, exist_ok=True)
+        os.link(src_real, dst_real)
+        created.append(str(dst_real))
+        log(f"CREATED HARD LINK: {src_real} -> {dst_real}")
+
+    return created, diagnostics
+
+
+
+===== FILE: app\services\logger.py =====
+from datetime import datetime
+from app.config import LOG_FILE
+
+def log(message: str):
+    stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with LOG_FILE.open("a", encoding="utf-8") as f:
+        f.write(f"[{stamp}] {message}\n")
+
+def read_log(lines: int = 200):
+    if not LOG_FILE.exists():
+        return ""
+    data = LOG_FILE.read_text(encoding="utf-8").splitlines()
+    return "\n".join(data[-lines:])
+
+
+
+===== FILE: app\services\qbittorrent.py =====
+from pathlib import Path
+import requests
+
+from app.config import DOWNLOADS_ROOT, VIDEO_EXTENSIONS
+from app.services.storage import load_import_db, read_history
+from app.services.utils import guess_type, strip_release_words, detect_year, detect_season
+
+
+def normalize_source_path(raw_path: str) -> str:
+    if not raw_path:
+        return ""
+    p = str(raw_path).replace("\\", "/")
+    p = p.replace("/mnt/user/NASDY/downloads", "/downloads")
+    p = p.replace("/mnt/user/downloads", "/downloads")
+    return p.rstrip("/")
+
+
+def normalize_qbit_url(raw_url: str) -> str:
+    url = (raw_url or "").strip().rstrip("/")
+    if url and not url.startswith(("http://", "https://")):
+        url = "http://" + url
+    return url
+
+
+def normalize_match_text(value: str) -> str:
+    return "".join(ch.lower() for ch in str(value or "") if ch.isalnum())
+
+
+def import_db_keys(db):
+    keys = set()
+    for key, entry in (db or {}).items():
+        if key:
+            keys.add(str(key))
+            keys.add(normalize_source_path(str(key)))
+        if isinstance(entry, dict):
+            for field in ("source", "source_key", "hash", "destination"):
+                value = entry.get(field)
+                if value:
+                    keys.add(str(value))
+                    keys.add(normalize_source_path(str(value)))
+    return {k for k in keys if k}
+
+
+def imported_from_db(db, candidates):
+    keys = import_db_keys(db)
+    for candidate in candidates:
+        if not candidate:
+            continue
+        c = str(candidate)
+        n = normalize_source_path(c)
+        if c in keys or n in keys:
+            return True
+    return False
+
+
+def qbit_session(settings):
+    session = requests.Session()
+    url = normalize_qbit_url(settings.get("qbittorrent_url", ""))
+    username = settings.get("qbittorrent_username", "")
+    password = settings.get("qbittorrent_password", "")
+
+    if not url:
+        raise ValueError("qBittorrent URL is required.")
+    if not username:
+        raise ValueError("qBittorrent username is required.")
+
+    login = session.post(
+        f"{url}/api/v2/auth/login",
+        data={"username": username, "password": password},
+        timeout=8,
+    )
+
+    if login.status_code not in (200, 204):
+        raise ValueError(f"qBittorrent login failed. HTTP {login.status_code}: {login.text[:80]}")
+
+    check = session.get(f"{url}/api/v2/app/version", timeout=8)
+    if check.status_code != 200:
+        raise ValueError(
+            f"qBittorrent login could not be verified. "
+            f"Login HTTP {login.status_code}, verify HTTP {check.status_code}: {check.text[:80]}"
+        )
+
+    return session, url
+
+
+def qbit_torrents(settings):
+    session, url = qbit_session(settings)
+    response = session.get(f"{url}/api/v2/torrents/info", timeout=10)
+    response.raise_for_status()
+    return response.json()
+
+
+def qbit_torrent_files(settings, torrent_hash: str):
+    if not torrent_hash:
+        return []
+
+    session, url = qbit_session(settings)
+    response = session.get(
+        f"{url}/api/v2/torrents/files",
+        params={"hash": torrent_hash},
+        timeout=10,
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+def is_video_name(name: str) -> bool:
+    return Path(str(name)).suffix.lower() in VIDEO_EXTENSIONS
+
+
+def completed_video_files(settings, torrent):
+    files = qbit_torrent_files(settings, torrent.get("hash", ""))
+    return [
+        f for f in files
+        if is_video_name(f.get("name", ""))
+        and float(f.get("progress", 0)) >= 1
+    ]
+
+
+def find_common_root(paths):
+    clean_parts = []
+    for p in paths:
+        parts = Path(p).parts
+        if len(parts) > 1:
+            clean_parts.append(parts[:-1])
+
+    if not clean_parts:
+        return ""
+
+    common = list(clean_parts[0])
+    for parts in clean_parts[1:]:
+        i = 0
+        while i < min(len(common), len(parts)) and common[i] == parts[i]:
+            i += 1
+        common = common[:i]
+
+    return str(Path(*common)) if common else ""
+
+
+def resolve_video_source(settings, torrent, video_files):
+    save_path = normalize_source_path(torrent.get("save_path") or "")
+    content_path = normalize_source_path(torrent.get("content_path") or "")
+    name = torrent.get("name") or ""
+
+    video_names = [vf.get("name", "") for vf in video_files if vf.get("name")]
+    common_root = find_common_root(video_names)
+
+    candidates = []
+
+    if content_path:
+        candidates.append(Path(content_path))
+
+    if save_path and common_root:
+        candidates.append(Path(save_path) / common_root)
+
+    if save_path and name:
+        candidates.append(Path(save_path) / name)
+
+    if save_path and len(video_files) == 1:
+        candidates.append(Path(save_path) / video_names[0])
+
+    seen = set()
+    for candidate in candidates:
+        candidate = Path(candidate)
+
+        if candidate.is_file():
+            candidate = candidate.parent
+
+        if str(candidate).rstrip("/") == str(DOWNLOADS_ROOT).rstrip("/"):
+            continue
+
+        key = str(candidate)
+        if key in seen:
+            continue
+        seen.add(key)
+
+        if not candidate.exists():
+            continue
+
+        matched = []
+        for vf in video_files:
+            qbit_name = Path(vf.get("name", "")).name
+            possible = list(candidate.rglob(qbit_name))
+            matched.extend([p for p in possible if p.is_file() and is_video_name(p.name)])
+
+        if matched:
+            return candidate, sorted(set(matched), key=lambda p: str(p).lower())
+
+    return None, []
+
+
+def history_import_keys():
+    keys = set()
+
+    try:
+        history = read_history(limit=500)
+    except Exception:
+        return keys
+
+    for item in history:
+        if item.get("type") == "error":
+            continue
+
+        for field in ("title", "destination", "source", "source_key", "hash"):
+            value = item.get(field, "")
+            if value:
+                keys.add(normalize_match_text(value))
+                keys.add(normalize_match_text(normalize_source_path(value)))
+
+    return keys
+
+
+def imported_from_history(name: str, title: str, year: str, source_path: str, history_keys: set, media_type: str = "", season: str = "") -> bool:
+    normalized_source = normalize_match_text(source_path)
+    normalized_title = normalize_match_text(title)
+    normalized_name = normalize_match_text(name)
+    normalized_year_title = normalize_match_text(f"{title} {year}".strip())
+
+    season_num = str(season or "").zfill(2)
+    season_tokens = {
+        normalize_match_text(f"Season {season_num}"),
+        normalize_match_text(f"Season {int(season_num)}") if season_num.isdigit() else "",
+        normalize_match_text(f"S{season_num}"),
+    }
+
+    for key in history_keys:
+        if not key:
+            continue
+
+        if media_type == "tv":
+            title_match = (
+                normalized_title and normalized_title in key
+            ) or (
+                normalized_name and normalized_name in key
+            ) or (
+                normalized_source and normalized_source in key
+            )
+
+            season_match = any(token and token in key for token in season_tokens)
+
+            if title_match and season_match:
+                return True
+
+            continue
+
+        candidates = [normalized_source, normalized_year_title, normalized_name, normalized_title]
+        for candidate in candidates:
+            if candidate and (candidate in key or key in candidate):
+                return True
+
+    return False
+
+
+def qbit_completed_items(settings):
+    torrents = qbit_torrents(settings)
+    db = load_import_db()
+    history_keys = history_import_keys()
+    items = []
+
+    for torrent in torrents:
+        if float(torrent.get("progress", 0)) < 1:
+            continue
+
+        video_files = completed_video_files(settings, torrent)
+
+        if not video_files:
+            continue
+
+        source_path, videos = resolve_video_source(settings, torrent, video_files)
+        if not source_path or not videos:
+            continue
+
+        name = torrent.get("name", source_path.name)
+        media_type = guess_type(name, len(videos))
+        torrent_hash = torrent.get("hash", "")
+        key = torrent_hash or str(source_path)
+        title = strip_release_words(name)
+        year = detect_year(name)
+        season = detect_season(name)
+
+        import_candidates = {
+            key,
+            torrent_hash,
+            str(source_path),
+            normalize_source_path(str(source_path)),
+            normalize_source_path(torrent.get("content_path") or ""),
+            normalize_source_path(torrent.get("save_path") or ""),
+            name,
+        }
+
+        imported = imported_from_db(db, import_candidates) or imported_from_history(
+            name=name,
+            title=title,
+            year=year,
+            source_path=str(source_path),
+            history_keys=history_keys,
+            media_type=media_type,
+            season=season,
+        )
+
+        items.append({
+            "name": name,
+            "path": str(source_path),
+            "video_count": len(videos),
+            "type": media_type,
+            "icon": "ðŸ“º" if media_type == "tv" else "ðŸŽ¬",
+            "type_label": "TV Show" if media_type == "tv" else "Movie",
+            "title": title,
+            "year": year,
+            "season": season,
+            "modified": "qBittorrent",
+            "source_kind": "torrent",
+            "source_key": key,
+            "imported": imported,
+            "hash": torrent_hash,
+            "state": torrent.get("state", ""),
+            "ratio": round(float(torrent.get("ratio", 0)), 2),
+            "tracker": torrent.get("tracker", ""),
+            "category": torrent.get("category", ""),
+            "tags": torrent.get("tags", ""),
+            "size": int(torrent.get("size", 0)),
+        })
+
+    return sorted(items, key=lambda x: (x["imported"], x["name"].lower()))
+
+
+def test_qbit(settings):
+    torrents = qbit_torrents(settings)
+    completed = sum(1 for t in torrents if float(t.get("progress", 0)) >= 1)
+    return completed
+
+
+
+===== FILE: app\services\queue.py =====
+from pathlib import Path
+from datetime import datetime
+
+from app.config import DOWNLOADS_ROOT, IGNORE_NAMES
+from app.services.utils import find_videos, guess_type, strip_release_words, detect_year, detect_season
+from app.services.storage import load_import_db, read_history
+from app.services.qbittorrent import qbit_completed_items, normalize_source_path, imported_from_db, imported_from_history, history_import_keys
+
+
+def folder_items():
+    folders = []
+    db = load_import_db()
+    history_keys = history_import_keys()
+
+    if not DOWNLOADS_ROOT.exists():
+        return folders
+
+    for p in sorted(DOWNLOADS_ROOT.iterdir(), key=lambda x: x.stat().st_mtime if x.exists() else 0, reverse=True):
+        if not p.is_dir() or p.name.lower() in IGNORE_NAMES:
+            continue
+
+        videos = find_videos(p)
+        if not videos:
+            continue
+
+        media_type = guess_type(p.name, len(videos))
+        stat = p.stat()
+        key = str(p)
+        title = strip_release_words(p.name)
+        year = detect_year(p.name)
+        season = detect_season(p.name)
+
+        imported = imported_from_db(db, {
+            key,
+            normalize_source_path(key),
+            p.name,
+        }) or imported_from_history(
+            name=p.name,
+            title=title,
+            year=year,
+            source_path=key,
+            history_keys=history_keys,
+            media_type=media_type,
+            season=season,
+        )
+
+        folders.append({
+            "name": p.name,
+            "path": str(p),
+            "video_count": len(videos),
+            "type": media_type,
+            "icon": "📺" if media_type == "tv" else "🎬",
+            "type_label": "TV Show" if media_type == "tv" else "Movie",
+            "title": title,
+            "year": year,
+            "season": season,
+            "modified": datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M"),
+            "source_kind": "folder",
+            "source_key": key,
+            "imported": imported,
+            "hash": "",
+            "state": "",
+            "ratio": "",
+        })
+
+    return folders
+
+
+def queue_items(settings):
+    if settings.get("qbittorrent_enabled"):
+        try:
+            items = qbit_completed_items(settings)
+            return items, "qBittorrent", None
+        except Exception as e:
+            return folder_items(), "Folders", f"qBittorrent error: {e}"
+
+    return folder_items(), "Folders", None
+
+
+
+===== FILE: app\services\storage.py =====
+import json
+from app.config import HISTORY_FILE, IMPORT_DB_FILE, SETTINGS_FILE
+
+DEFAULT_SETTINGS = {
+    "qbittorrent_enabled": False,
+    "qbittorrent_url": "",
+    "qbittorrent_username": "",
+    "qbittorrent_password": "",
+    "tmdb_api_key": "",
+    "jellyfin_url": "",
+    "jellyfin_api_key": "",
+    "developer_mode": True,
+}
+
+def load_json(path, default):
+    if not path.exists():
+        return default.copy() if isinstance(default, dict) else default
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return default.copy() if isinstance(default, dict) else default
+
+def save_json(path, data):
+    path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+def load_settings():
+    data = DEFAULT_SETTINGS.copy()
+    data.update(load_json(SETTINGS_FILE, {}))
+    return data
+
+def save_settings(data):
+    cleaned = DEFAULT_SETTINGS.copy()
+    cleaned.update(data)
+    save_json(SETTINGS_FILE, cleaned)
+
+def load_import_db():
+    return load_json(IMPORT_DB_FILE, {})
+
+def save_import_db(db):
+    save_json(IMPORT_DB_FILE, db)
+
+def append_history(entry):
+    with HISTORY_FILE.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(entry) + "\n")
+
+def read_history(limit=30):
+    if not HISTORY_FILE.exists():
+        return []
+    lines = HISTORY_FILE.read_text(encoding="utf-8").splitlines()
+    out = []
+    for line in reversed(lines[-limit:]):
+        try:
+            out.append(json.loads(line))
+        except Exception:
+            pass
+    return out
+
+
+
+===== FILE: app\services\tmdb.py =====
+import requests
+
+
+def tmdb_search(settings, media_type: str, title: str, year: str = ""):
+    """
+    Search TMDb for a movie or TV show.
+
+    Returns a small normalized metadata object or None.
+    """
+    api_key = settings.get("tmdb_api_key", "").strip()
+    if not api_key or not title:
+        return None
+
+    endpoint = "tv" if media_type == "tv" else "movie"
+    url = f"https://api.themoviedb.org/3/search/{endpoint}"
+
+    params = {
+        "api_key": api_key,
+        "query": title,
+        "include_adult": "false",
+        "language": "en-US",
+        "page": 1,
+    }
+
+    if year:
+        if media_type == "tv":
+            params["first_air_date_year"] = year
+        else:
+            params["year"] = year
+
+    try:
+        response = requests.get(url, params=params, timeout=8)
+        response.raise_for_status()
+        results = response.json().get("results", [])
+
+        if not results and year:
+            # Fall back without year if the first search was too strict.
+            params.pop("first_air_date_year", None)
+            params.pop("year", None)
+            response = requests.get(url, params=params, timeout=8)
+            response.raise_for_status()
+            results = response.json().get("results", [])
+
+        if not results:
+            return None
+
+        item = results[0]
+        poster_path = item.get("poster_path")
+        backdrop_path = item.get("backdrop_path")
+        release_date = item.get("first_air_date") or item.get("release_date") or ""
+
+        return {
+            "id": item.get("id"),
+            "media_type": media_type,
+            "title": item.get("name") or item.get("title") or title,
+            "year": release_date[:4],
+            "overview": item.get("overview", ""),
+            "poster": f"https://image.tmdb.org/t/p/w342{poster_path}" if poster_path else "",
+            "backdrop": f"https://image.tmdb.org/t/p/w780{backdrop_path}" if backdrop_path else "",
+            "score": round(float(item.get("vote_average", 0)), 1),
+            "votes": int(item.get("vote_count", 0)),
+        }
+    except Exception:
+        return None
+
+
+def test_tmdb(settings):
+    """
+    Validate the TMDb API key by calling the configuration endpoint.
+    """
+    api_key = settings.get("tmdb_api_key", "").strip()
+    if not api_key:
+        raise ValueError("TMDb API key is required.")
+
+    response = requests.get(
+        "https://api.themoviedb.org/3/configuration",
+        params={"api_key": api_key},
+        timeout=8,
+    )
+
+    if response.status_code != 200:
+        raise ValueError(f"TMDb connection failed. HTTP {response.status_code}: {response.text[:100]}")
+
+    return True
+
+
+
+===== FILE: app\services\utils.py =====
+import re
+from pathlib import Path
+from app.config import VIDEO_EXTENSIONS, QUALITY_WORDS
+
+def clean_spaces(text: str) -> str:
+    return re.sub(r"\s+", " ", str(text)).strip()
+
+def pretty(text: str) -> str:
+    text = str(text).replace(".", " ").replace("_", " ")
+    text = re.sub(r"\s+-\s+", " ", text)
+    return clean_spaces(text)
+
+def safe_name(text: str) -> str:
+    text = re.sub(r'[\\/:*?"<>|]', "-", str(text))
+    return clean_spaces(text)
+
+def title_case_guess(text: str) -> str:
+    small = {"of","the","a","an","and","or","in","on","at","to","for","with","by","from"}
+    out = []
+    for i, w in enumerate(str(text).split()):
+        if w.upper() in {"TV", "FBI", "CSI", "NCIS", "UHD", "USA", "DC"}:
+            out.append(w.upper())
+        elif i != 0 and w.lower() in small:
+            out.append(w.lower())
+        else:
+            out.append(w[:1].upper() + w[1:])
+    return " ".join(out)
+
+def detect_year(text: str) -> str:
+    years = re.findall(r"\b(19\d{2}|20\d{2})\b", str(text))
+    return years[0] if years else ""
+
+def detect_season(text: str) -> str:
+    text = str(text)
+    m = re.search(r"\bS(\d{1,2})\b", text, re.I)
+    if m:
+        return f"{int(m.group(1)):02d}"
+    m = re.search(r"\bSeason[ ._-]*(\d{1,2})\b", text, re.I)
+    if m:
+        return f"{int(m.group(1)):02d}"
+    return "01"
+
+def detect_episode(filename: str) -> str:
+    filename = str(filename)
+    m = re.search(r"\bS\d{1,2}E(\d{1,3})\b", filename, re.I)
+    if m:
+        return f"{int(m.group(1)):02d}"
+    m = re.search(r"\b\d{1,2}x(\d{1,3})\b", filename, re.I)
+    if m:
+        return f"{int(m.group(1)):02d}"
+    return ""
+
+def strip_release_words(text: str) -> str:
+    original = str(text)
+    text = pretty(text)
+    text = re.sub(r"\s+S\d{1,2}.*$", "", text, flags=re.I)
+    text = re.sub(r"\s+Season\s*\d{1,2}.*$", "", text, flags=re.I)
+    text = re.sub(r"\s+\b(19\d{2}|20\d{2})\b.*$", "", text)
+    for word in QUALITY_WORDS:
+        text = re.sub(rf"\s+\b{re.escape(word)}\b.*$", "", text, flags=re.I)
+    text = re.sub(r"\[[^\]]+\]|\([^\)]*?(remux|x264|x265|hevc|web|bluray|hdr)[^\)]*?\)", "", text, flags=re.I)
+    text = clean_spaces(text)
+    return title_case_guess(text) if text else original
+
+def find_videos(folder: Path):
+    folder = Path(folder)
+    if not folder.exists():
+        return []
+    return sorted(
+        [p for p in folder.rglob("*") if p.is_file() and p.suffix.lower() in VIDEO_EXTENSIONS],
+        key=lambda p: str(p).lower()
+    )
+
+def guess_type(name: str, video_count: int) -> str:
+    if re.search(r"\bS\d{1,2}\b|\bSeason[ ._-]*\d{1,2}\b", str(name), re.I):
+        return "tv"
+    if video_count >= 3:
+        return "tv"
+    return "movie"
+
+
+
+===== FILE: app\services\__init__.py =====
+
+
+===== FILE: app\services\__pycache__\jellyfin.cpython-312.pyc =====
+Ë
+    @ÛAj3  ã                   ó   — d dl Z d„ Zy)é    Nc                 ó6  — | j                  dd«      j                  d«      }| j                  dd«      }|r|sy	 t        j                  |› dd|id¬	«      }|j                  d
+v rydd|j                  › dfS # t
+        $ r}dt        |«      fcY d }~S d }~ww xY w)NÚjellyfin_urlÚ Ú/Újellyfin_api_key)Fz Jellyfin refresh not configured.z/Library/RefreshzX-Emby-Tokené   )ÚheadersÚtimeout)éÈ   éÌ   )TzJellyfin scan requested.FzJellyfin returned HTTP Ú.)ÚgetÚrstripÚrequestsÚpostÚstatus_codeÚ	ExceptionÚstr)ÚsettingsÚurlÚapi_keyÚrÚes        ú7C:\Projects\nasdy-media-linker\app\services\jellyfin.pyÚjellyfin_refreshr      s¡   € Ø
+,‰,~ rÓ
+*×
+1Ñ
+1°#Ó
+6€CØl‰lÐ-¨rÓ2€GÙ‘gØ8ðÜM‰M˜S˜EÐ!1Ð2¸^ÈWÐ<UÐ_`ÔaˆØ=‰=˜JÑ&Ø3ØÐ/°·±¨¸aÐ@Ð@Ð@øÜò Ø”c˜!“fˆ}Õûðús#   º+A8 Á&A8 Á8	BÂBÂBÂB)r   r   © ó    r   Ú<module>r      s   ðÛ ór   
+
+
+===== FILE: app\services\__pycache__\library.cpython-312.pyc =====
+Ë
+    FÉAj$  ã            	       óÞ   — d dl mZ d dlZd dlmZmZmZ dedefd„Zdedefd„Z	dedefd	„Z
+d
+edefd„Zdeded
+edefd„Zdedefd„Zdefd„Zddedefd„Zddedefd„Zddedededefd„Zy)é    )ÚPathN)ÚMOVIES_ROOTÚTV_ROOTÚVIDEO_EXTENSIONSÚvalueÚreturnc                 óL   — dj                  d„ t        | xs d«      D «       «      S )NÚ c              3   ó^   K  — | ]%  }|j                  «       sŒ|j                  «       –— Œ' y ­w)N)ÚisalnumÚlower)Ú.0Úchs     ú6C:\Projects\nasdy-media-linker\app\services\library.pyÚ	<genexpr>z!normalize_text.<locals>.<genexpr>   s!   è ø€ ÐIÑ(8 "¸B¿J¹J½L2—8‘8—:Ñ(8ùs   ‚-˜-)ÚjoinÚstr)r   s    r   Únormalize_textr      s    € Ø7‰7ÑI¬¨EªK°RÔ(8ÓIÓIÐIó    Úfolder_namec                 ó
+  — t        | xs d«      }t        j                  dd|«      }t        j                  dd|«      }|j                  dd«      j                  dd«      }t        j                  dd|«      j	                  «       S )Nr
+   z\((19\d{2}|20\d{2})\)Ú z\[(19\d{2}|20\d{2})\]Ú.Ú_z\s+)r   ÚreÚsubÚreplaceÚstrip)r   Útexts     r   Úclean_folder_titler       sp   € Üˆ{Ò ˜bÓ!€DÜ6‰6Ð*¨C°Ó6€DÜ6‰6Ð*¨C°Ó6€DØ<‰<˜˜SÓ!×)Ñ)¨#¨sÓ3€DÜ6‰6&˜#˜tÓ$×*Ñ*Ó,Ð,r   c                 ór   — t        j                  dt        | xs d«      «      }|r|j                  d«      S dS )Nz\b(19\d{2}|20\d{2})\br
+   é   )r   Úsearchr   Úgroup)r   Úmatchs     r   Úextract_yearr&      s1   € ÜI‰IÐ.´°E²K¸RÓ0@ÓA€EÙ"ˆ5;‰;q‹>Ð*¨Ð*r   Úfolderc                 óf   — | j                  «       syt        d„ | j                  d«      D «       «      S )Nr   c              3   ó€   K  — | ]6  }|j                  «       r$|j                  j                  «       t        v rd –— Œ8 y­w)r"   N)Úis_fileÚsuffixr   r   )r   Úps     r   r   zvideo_count.<locals>.<genexpr>   s4   è ø€ ð Ù$ˆaØ9‰9Œ;˜1Ÿ8™8Ÿ>™>Ó+Ô/?Ñ?ô 	
+Ñ$ùs   ‚<>Ú*)ÚexistsÚsumÚrglob)r'   s    r   Úvideo_countr1      s1   € Ø=‰=Œ?ØÜñ Ø—<‘< Ô$óó ð r   Úquery_titleÚ
+query_yearc                 ó  — |j                   }t        |«      }t        |«      }t        | «      }t        |«      }t        |«      }|syd}	||k(  r|	dz  }	n||v s||v r|	dz  }	n	||v r|	dz  }	|r|r||k(  r|	dz  }	|	S |	dz  }	|	S |r	||v r|	dz  }	|	S )Nr   éd   éK   é<   é(   é   é   )Únamer    r&   r   )
+r2   r3   r'   r   Úfolder_titleÚfolder_yearÚ
+query_normÚfolder_normÚfolder_full_normÚscores
+             r   Úfolder_scorerB   !   sÍ   € Ø—+‘+€KÜ% kÓ2€LÜ˜{Ó+€Kä Ó,€JÜ  Ó.€KÜ% kÓ2ÐáØà€Eà[Ò Ø‰‰Ø	{Ñ	" k°ZÑ&?Ø‰‰Ø	Ð'Ñ	'Ø‰ˆá‘kØ˜Ò$ØR‰KˆEð €Lð	 R‰KˆEð €Lñ 
+˜
+ kÑ1Ø‰ˆà€Lr   Úshow_folderÚseasonc                 ó°   — t        |xs d«      j                  d«      }t        |«      }d|› d|› d|› d|› d|› g}|D cg c]  }| |z  ‘Œ	 c}S c c}w )NÚ01é   zSeason ÚSzSeries )r   ÚzfillÚint)rC   rD   Ú
+season_numÚ
+season_intÚnamesr;   s         r   Úseason_folder_candidatesrN   A   s~   € ÜV’^˜tÓ$×*Ñ*¨1Ó-€JÜZ“€Jð *ÐØ
+*ÐØ
+ˆJˆ<ÐØ
+*ÐØ
+*Ðð€Eñ ,1Ó1©5 4ˆK˜$Ó¨5Ñ1Ð1ùÒ1s   ÁAÚseason_folderc                 ó:  — t        «       }| j                  «       sg S | j                  d«      D ]á  }|j                  «       r |j                  j                  «       t        vrŒ4|j                  }t        j                  d|t        j                  «      }|r*|j                  t        |j                  d«      «      «       Œ‘t        j                  d|t        j                  «      }|sŒ¹|j                  t        |j                  d«      «      «       Œã t        |«      S )Nr-   z\bS\d{1,2}E(\d{1,3})\br"   z\b\d{1,2}x(\d{1,3})\b)Úsetr.   r0   r*   r+   r   r   r;   r   r#   ÚIÚaddrJ   r$   Úsorted)rO   ÚepisodesÚfiler   r%   s        r   Úexisting_episode_numbersrW   P   sÏ   € Ü‹u€HØ×ÑÔ!Øˆ	à×#Ñ# CÖ(ˆØ|‰|Œ~ §¡×!2Ñ!2Ó!4Ô<LÑ!LØày‰yˆÜ—	‘	Ð3°T¼2¿4¹4Ó@ˆÙØL‰Lœ˜UŸ[™[¨›^Ó,Ô-Øä—	‘	Ð2°D¼"¿$¹$Ó?ˆÚØL‰Lœ˜UŸ[™[¨›^Ó,Õ-ð )ô (ÓÐr   ÚtitleÚyearc           	      ór  — t        j                  «       sy d }t        j                  «       D ]n  }|j                  «       sŒt	        | ||«      }|dk  rŒ'd|j
+                  t        |«      |t        |j
+                  «      t        |«      dœ}||d   |d   kD  sŒm|}Œp |r|d   dk\  r|d   dk\  rdnd|d	<   |S y )
+Nr   Úmovie)ÚkindrX   ÚpathrA   rY   r1   rA   r7   r5   ÚhighÚmediumÚ
+confidence)	r   r.   ÚiterdirÚis_dirrB   r;   r   r&   r1   )rX   rY   Úbestr'   rA   Úcurrents         r   Úfind_movie_matchre   f   sÉ   € Ü×ÑÔØà€DÜ×%Ñ%Ö'ˆØ}‰}ŒØä˜U D¨&Ó1ˆØAŠ:Øð Ø—[‘[Ü˜“KØÜ  §¡Ó-Ü& vÓ.ñ
+ˆð ˆ<˜7 7Ñ+¨d°7©mÓ;Ø‰Dð% (ñ( W‘ Ò#Ø'+¨G¡}¸Ò';™VÀˆˆ\ÑØˆàr   c                 ó
+  — t        j                  «       sy d }t        j                  «       D ]º  }|j                  «       sŒt	        | d|«      }|dk  rŒ'd }t        ||«      D ]  }|j                  «       sŒ|} n d|j                  t        |«      |t        |xs d«      j                  d«      t        |«      |rt        |«      nd|rt        |«      ng dœ}||d   |d   kD  sŒ¹|}Œ¼ |r|d   dk\  r|d   d	k\  rd
+nd|d<   |S y )Nr
+   r   ÚtvrF   rG   )r\   rX   r]   rA   rD   Úseason_existsÚseason_pathÚexisting_episodesrA   r7   r5   r^   r_   r`   )r   r.   ra   rb   rB   rN   r;   r   rI   ÚboolrW   )rX   rD   rc   rC   rA   Úfound_season_folderÚ	candidaterd   s           r   Úfind_tv_matchrn   †   s!  € Ü>‰>ÔØà€DÜ—‘Ö(ˆØ×!Ñ!Ô#Øä˜U B¨Ó4ˆØAŠ:Øà"ÐÜ1°+¸vÖFˆIØ×ÑÕ!Ø&/Ð#Ùð Gð Ø ×%Ñ%Ü˜Ó$ØÜ˜&š. DÓ)×/Ñ/°Ó2Ü!Ð"5Ó6Ù7Jœ3Ð2Ô3ÐPRÙReÔ!9Ð:MÔ!NÐkmñ	
+ˆð ˆ<˜7 7Ñ+¨d°7©mÓ;Ø‰Dð5 )ñ8 W‘ Ò#Ø'+¨G¡}¸Ò';™VÀˆˆ\ÑØˆàr   Ú
+media_typec                 ó<   — | dk(  rt        ||«      S t        ||«      S )Nr[   )re   rn   )ro   rX   rY   rD   s       r   Úfind_library_matchrq   ®   s$   € ØWÒÜ  tÓ,Ð,ä˜ Ó'Ð'r   )r
+   )rF   )r
+   rF   )Úpathlibr   r   Ú
+app.configr   r   r   r   r   r    r&   rJ   r1   rB   rN   rW   re   rn   rq   © r   r   Ú<module>ru      sê   ðÝ Û 	ç =Ñ =ðJ˜#ð J #ó Jð- Cð -¨Có -ð+˜ð + ó +ð
+˜ð  ó ð˜cð ¨sð ¸Dð ÀSó ð@2¨$ð 2¸ó 2ð¨Dó ñ,˜Cð  só ñ@%˜ð % có %ñP( 3ð (¨sð (¸#ð (ÈCô (r   
+
+
+===== FILE: app\services\__pycache__\linker.cpython-312.pyc =====
+Ë
+    @ÛAjž  ã            
+       óÂ   — d dl Z d dlmZ d dlmZmZmZmZ d dlm	Z	m
+Z
+mZ d dlmZ dededed	ed
+ef
+d„Zdedefd„Zdedefd„Zdededefd„Zdefd„Zdedefd„Zd„ Zy)é    N)ÚPath)ÚDOWNLOADS_ROOTÚMOVIES_ROOTÚTV_ROOTÚHOST_MNT_ROOT)Úfind_videosÚdetect_episodeÚ	safe_name)ÚlogÚ
+media_typeÚsourceÚtitleÚyearÚseasonc           
+      óú  — t        |«      }t        |«      }|j                  «       }|j                  «       }|j                  «       xs d}|j                  «       st	        d|› «      ‚|st	        d«      ‚|st	        d«      ‚g }| dk(  r¤t        |«      d›}|r|› d|› dn|}t        t        |«      z  d	|› z  }	d
+}
+|D ]h  }t        |j                  «      }|s	|
+d›}|
+d
+z  }
+t        |› d|› d|› |j                  j                  «       › «      }|j                  ||	|z  ||dœ«       Œj |	|fS |r|› d|› dn|}t        t        |«      z  }	t        |«      d
+k(  rH|d   }t        |› |j                  j                  «       › «      }|j                  ||	|z  |dœ«       |	|fS t        |d
+¬«      D ]G  \  }}t        |› d|› |j                  j                  «       › «      }|j                  ||	|z  |dœ«       ŒI |	|fS )NÚ01zSource folder does not exist: zTitle is required.zNo video files found.ÚtvÚ02dz (Ú)zSeason é   z - SÚE)ÚsrcÚdstÚnew_nameÚepisoder   )r   r   r   )Ústartz - Part )r   r   ÚstripÚexistsÚ
+ValueErrorÚintr   r
+   r	   ÚnameÚsuffixÚlowerÚappendr   ÚlenÚ	enumerate)r   r   r   r   r   Úsource_pathÚvideosÚitemsÚdisplayÚdest_dirÚfallbackr   Úepr   Úidxs                  ú5C:\Projects\nasdy-media-linker\app\services\linker.pyÚ
+build_planr0      s.  € Üv“,€KÜ˜Ó%€FØK‰K‹M€EØ:‰:‹<€DØ\‰\‹^Ò#˜t€Fà×ÑÔÜÐ9¸+¸ÐGÓHÐHÙÜÐ-Ó.Ð.ÙÜÐ0Ó1Ð1à€EØTÒÜ˜“K Ð$ˆÙ)-UG˜2˜d˜V 1Ñ%°5ˆÜœY wÓ/Ñ/°G¸F¸8Ð2DÑDˆØˆÛˆCÜ §¡Ó)ˆBÙØ  ~Ø˜A‘Ü  G 9¨D°°¸¸"¸¸c¿j¹j×>NÑ>NÓ>PÐ=QÐ!RÓSˆHØL‰L ¨X¸Ñ-@ÈhÐceÑfÕgð ð$ Uˆ?Ðñ *.UG˜2˜d˜V 1Ñ%°5ˆÜ¤¨7Ó!3Ñ3ˆÜˆv‹;˜!ÒØ˜‘)ˆCÜ  G 9¨S¯Z©Z×-=Ñ-=Ó-?Ð,@Ð!AÓBˆHØL‰L ¨X¸Ñ-@ÈhÑWÔXð
+ Uˆ?Ðô & f°A×6‘SÜ$¨ y°¸¸¸c¿j¹j×>NÑ>NÓ>PÐ=QÐ%RÓSØ—‘ S°¸HÑ1DÐRZÑ[Õ\ð 7ð Uˆ?Ðó    Úcontainer_pathÚreturnc                 ó>  — t        | «      }t        |«      }|j                  d«      r2|j                  d«      j	                  d«      }t
+        dz  dz  dz  |z  S |j                  d«      r2|j                  d«      j	                  d«      }t
+        dz  dz  dz  |z  S |S )zÍ
+    Convert container paths to the host /mnt/user path through /host_mnt mount:
+    /downloads/foo -> /host_mnt/user/NASDY/downloads/foo
+    /media/Movies/foo -> /host_mnt/user/NASDY/media/Movies/foo
+    z
+/downloadsÚ/ÚuserÚNASDYÚ	downloadsú/mediaÚmedia)r   ÚstrÚ
+startswithÚremoveprefixÚlstripr   )r2   ÚpÚsÚrels       r/   Úcontainer_to_host_user_pathrB   /   sš   € ô 	ˆ^Ó€AÜˆA‹€AØ‡||LÔ!Øn‰n˜\Ó*×1Ñ1°#Ó6ˆÜ˜vÑ%¨Ñ/°+Ñ=ÀÑCÐCØ‡||HÔØn‰n˜XÓ&×-Ñ-¨cÓ2ˆÜ˜vÑ%¨Ñ/°'Ñ9¸CÑ?Ð?Ø€Hr1   c                 ó>  — t        | «      }t        |«      }d}|j                  |«      r|j                  |«      }n|S g }t        dz  gt        t	        j                  d«      «      z   D ]  }|j                  ||z  «       Œ |D ]  }|j                  «       sŒ|c S  |S )z­
+    Resolve a /mnt/user FUSE path to a real /mnt/cache or /mnt/diskX path as exposed inside container.
+    If the path exists as a file, search by relative path first.
+    z/host_mnt/user/Úcachezdisk*)	rB   r;   r<   r=   r   ÚsortedÚglobr$   r   )r2   Ú	user_pathr@   ÚmarkerrA   Ú
+candidatesÚrootÚcs           r/   Úresolve_real_host_pathrL   ?   sŸ   € ô
+ ,¨NÓ;€IÜˆI‹€Að €FØ‡||FÔØn‰n˜VÓ$‰àÐà€JÜ Ñ(Ð)¬F´=×3EÑ3EÀgÓ3NÓ,OÔOˆØ×Ñ˜$ ™*Õ%ð Pó ˆØ8‰8:ØŠHð ð
+ Ðr1   Úsrc_realÚdst_containerc                 ó0  — | j                   }t        |«      dk\  r |d   dk(  rt        d«      |d   z  |d   z  }nt        |«      S t	        |«      }|j                  d«      r+|j                  d«      j                  d«      }|dz  dz  |z  S t        |«      S )	zÓ
+    Given real source path (/host_mnt/cache/NASDY/downloads/...) and destination container path
+    (/media/Movies/...), create matching destination on same root:
+    /host_mnt/cache/NASDY/media/Movies/...
+    é   r   Úhost_mntr5   é   r9   r7   r:   )Úpartsr%   r   rB   r;   r<   r=   r>   )rM   rN   Ú	src_partsÚ	disk_rootÚdst_srA   s         r/   Úmatching_dest_on_source_diskrW   Y   s   € ð —‘€Iä
+ˆ9ƒ~˜Ò˜y¨™|¨zÒ9Ü˜“I 	¨!¡Ñ,¨y¸©|Ñ;‰	ä*¨=Ó9Ð9äÓ€EØ×Ñ˜Ô!Ø× Ñ  Ó*×1Ñ1°#Ó6ˆØ˜7Ñ" WÑ,¨sÑ2Ð2Ü& }Ó5Ð5r1   Úpathc                 óœ   — 	 t        j                  | j                  «       r| n| j                  «      }|j                  S # t
+        $ r Y y w xY w)N)ÚosÚstatr   ÚparentÚst_devÚ	Exception)rX   Ústs     r/   Ústat_devicer`   l   s?   € ðÜW‰W˜TŸ[™[œ]‘T°·±Ó<ˆØy‰yÐøÜò Ùðús   ‚<? ¿	AÁ
+AÚsrc_containerc                 ó>  — t        | «      }t        ||«      }t        | «      t        |«      t        |«      t        |«      |j                  «       |j                  «       t	        |«      t	        |j
+                  «      t	        |«      t	        |j
+                  «      k(  dœ	S )N)	ra   rN   rM   Údst_realÚ
+src_existsÚ
+dst_existsÚ
+src_deviceÚdst_parent_deviceÚsame_device)rL   rW   r;   r   r`   r\   )ra   rN   rM   rc   s       r/   Údiagnostic_for_linkri   s   s~   € Ü% mÓ4€HÜ+¨H°mÓD€Hä˜]Ó+Ü˜]Ó+Ü˜“MÜ˜“MØ—o‘oÓ'Ø—o‘oÓ'Ü! (Ó+Ü(¨¯©Ó9Ü" 8Ó,´¸H¿O¹OÓ0LÑLñ
+ð 
+r1   c                 ó  — g }g }| D ]   }t        |d   «      }t        |d   «      }t        ||«      }|j                  |«       t        |d   «      }t        |d   «      }t        d|› «       |j	                  «       st        d|› «      ‚|j	                  «       rt        d|› «      ‚|j                  j                  dd¬	«       t        j                  ||«       |j                  t        |«      «       t        d
+|› d|› «       Œ ||fS )Nr   r   rM   rc   zLINK DIAG: z Resolved source does not exist: zAlready exists: T)ÚparentsÚexist_okzCREATED HARD LINK: z -> )r   ri   r$   r   r   ÚFileNotFoundErrorÚFileExistsErrorr\   ÚmkdirrZ   Úlinkr;   )	r)   ÚcreatedÚdiagnosticsÚitemra   rN   ÚdiagrM   rc   s	            r/   Úcreate_hard_linksru   ‚   s  € Ø€GØ€KäˆÜ˜T %™[Ó)ˆÜ˜T %™[Ó)ˆÜ" =°-Ó@ˆØ×Ñ˜4Ô ä˜˜ZÑ(Ó)ˆÜ˜˜ZÑ(Ó)ˆäˆk˜$˜Ð Ô!à‰Ô Ü#Ð&FÀxÀjÐ$QÓRÐRØ?‰?ÔÜ!Ð$4°X°JÐ"?Ó@Ð@à‰×Ñ d°TÐÔ:Ü
+‰˜(Ô#Ø‰”s˜8“}Ô%ÜÐ! ( ¨4°¨zÐ:Ö;ð' ð* KÐÐr1   )rZ   Úpathlibr   Ú
+app.configr   r   r   r   Úapp.services.utilsr   r	   r
+   Úapp.services.loggerr   r;   r0   rB   rL   rW   r`   ri   ru   © r1   r/   Ú<module>r{      s§   ðÛ 	Ý ß JÓ Jß EÑ EÝ #ð&˜3ð &¨ð &°Cð &¸sð &ÈCó &ðP°ð ¸ó ð ¨4ð °Dó ð46¨4ð 6Àð 6Èó 6ð&dó ð tð ¸Dó ó r1   
+
+
+===== FILE: app\services\__pycache__\logger.cpython-312.pyc =====
+Ë
+    @ÛAjŸ  ã                   ó6   — d dl m Z  d dlmZ defd„Zddefd„Zy)	é    )Údatetime)ÚLOG_FILEÚmessagec                 óÒ   — t        j                  «       j                  d«      }t        j                  dd¬«      5 }|j                  d|› d| › d«       d d d «       y # 1 sw Y   y xY w)Nz%Y-%m-%d %H:%M:%SÚaúutf-8©ÚencodingÚ[z] Ú
+)r   ÚnowÚstrftimer   ÚopenÚwrite)r   ÚstampÚfs      ú5C:\Projects\nasdy-media-linker\app\services\logger.pyÚlogr      sP   € ÜL‰L‹N×#Ñ#Ð$7Ó8€EÜ	‰s WÕ	-°Ø	‰!E7˜"˜W˜I RÐ(Ô)÷ 
+.×	-Ñ	-ús   »AÁA&Úlinesc                 óž   — t        j                  «       syt        j                  d¬«      j                  «       }dj	                  ||  d  «      S )NÚ r   r	   r   )r   ÚexistsÚ	read_textÚ
+splitlinesÚjoin)r   Údatas     r   Úread_logr   	   s?   € Ü?‰?ÔØÜ×Ñ wÔ/×:Ñ:Ó<€DØ9‰9T˜5˜&˜']Ó#Ð#ó    N)éÈ   )r   Ú
+app.configr   Ústrr   Úintr   © r   r   Ú<module>r$      s#   ðÝ Ý ð*ó *ñ
+$Cô $r   
+
+
+===== FILE: app\services\__pycache__\qbittorrent.cpython-312.pyc =====
+Ë
+    ÀïBjG'  ã                   ó  — d dl mZ d dlZd dlmZmZ d dlmZmZ d dl	m
+Z
+mZmZmZ dedefd„Zd	edefd
+„Zdedefd„Zd„ Zd„ Zd„ Zd„ Zdefd„Zdedefd„Zd„ Zd„ Zd„ Zd„ Zd"dedededededededefd„Zd „ Zd!„ Z y)#é    )ÚPathN)ÚDOWNLOADS_ROOTÚVIDEO_EXTENSIONS)Úload_import_dbÚread_history)Ú
+guess_typeÚstrip_release_wordsÚdetect_yearÚdetect_seasonÚraw_pathÚreturnc                 ó¨   — | syt        | «      j                  dd«      }|j                  dd«      }|j                  dd«      }|j                  d«      S )NÚ Ú\Ú/z/mnt/user/NASDY/downloadsz
+/downloadsz/mnt/user/downloads)ÚstrÚreplaceÚrstrip)r   Úps     úapp\services\qbittorrent.pyÚnormalize_source_pathr   	   sN   € ÙØÜˆH‹×Ñ˜d CÓ(€AØ		‰	Ð-¨|Ó<€AØ		‰	Ð'¨Ó6€AØ8‰8C‹=Ðó    Úraw_urlc                 ó|   — | xs dj                  «       j                  d«      }|r|j                  d«      sd|z   }|S )Nr   r   )úhttp://zhttps://r   )Ústripr   Ú
+startswith)r   Úurls     r   Únormalize_qbit_urlr      s<   € ØŠ=b×
+Ñ
+Ó
+!×
+(Ñ
+(¨Ó
+-€CÙ
+3—>‘>Ð"9Ô:Ø˜#‰oˆØ€Jr   Úvaluec                 óL   — dj                  d„ t        | xs d«      D «       «      S )Nr   c              3   ó^   K  — | ]%  }|j                  «       sŒ|j                  «       –— Œ' y ­w©N)ÚisalnumÚlower)Ú.0Úchs     r   Ú	<genexpr>z'normalize_match_text.<locals>.<genexpr>   s!   è ø€ ÐIÑ(8 "¸B¿J¹J½L2—8‘8—:Ñ(8ùs   ‚-˜-)Újoinr   )r    s    r   Únormalize_match_textr*      s    € Ø7‰7ÑI¬¨EªK°RÔ(8ÓIÓIÐIr   c           	      óÎ  — t        «       }| xs i j                  «       D ]­  \  }}|r=|j                  t        |«      «       |j                  t	        t        |«      «      «       t        |t        «      sŒVdD ]S  }|j                  |«      }|sŒ|j                  t        |«      «       |j                  t	        t        |«      «      «       ŒU Œ¯ |D ch c]  }|sŒ|’Œ	 c}S c c}w )N)ÚsourceÚ
+source_keyÚhashÚdestination)ÚsetÚitemsÚaddr   r   Ú
+isinstanceÚdictÚget)ÚdbÚkeysÚkeyÚentryÚfieldr    Úks          r   Úimport_db_keysr<      sµ   € Ü‹5€DØ’x˜R×&Ñ&Ö(‰
+ˆˆUÙØH‰H”S˜“XÔØH‰HÔ*¬3¨s«8Ó4Ô5ÜeœTÕ"ÛHØŸ	™	 %Ó(ÚØ—H‘HœS ›ZÔ(Ø—H‘HÔ2´3°u³:Ó>Õ?ñ	 Ið )ñ Ó!‘t!šqŠAtÑ!Ð!ùÒ!s   ÃC"ÃC"c                 ón   — t        | «      }|D ]%  }|sŒt        |«      }t        |«      }||v s||v sŒ% y y)NTF)r<   r   r   )r6   Ú
+candidatesr7   Ú	candidateÚcÚns         r   Úimported_from_dbrB   ,   sD   € Ü˜"Ó€DÛˆ	ÙØÜ	‹NˆÜ! !Ó$ˆØ‰9˜˜Tš	Ùð  ð r   c           
+      ó8  — t        j                  «       }t        | j                  dd«      «      }| j                  dd«      }| j                  dd«      }|st	        d«      ‚|st	        d«      ‚|j                  |› d||dœd	¬
+«      }|j                  dvr(t	        d|j                  › d|j                  d d › «      ‚|j                  |› dd	¬«      }|j                  dk7  r5t	        d|j                  › d|j                  › d|j                  d d › «      ‚||fS )NÚqbittorrent_urlr   Úqbittorrent_usernameÚqbittorrent_passwordzqBittorrent URL is required.z!qBittorrent username is required.z/api/v2/auth/login)ÚusernameÚpasswordé   )ÚdataÚtimeout)éÈ   éÌ   zqBittorrent login failed. HTTP z: éP   z/api/v2/app/version©rK   rL   z4qBittorrent login could not be verified. Login HTTP z, verify HTTP )ÚrequestsÚSessionr   r5   Ú
+ValueErrorÚpostÚstatus_codeÚtext)ÚsettingsÚsessionr   rG   rH   ÚloginÚchecks          r   Úqbit_sessionrZ   8   sL  € Ü×ÑÓ €GÜ
+˜XŸ\™\Ð*;¸RÓ@Ó
+A€CØ|‰|Ð2°BÓ7€HØ|‰|Ð2°BÓ7€HáÜÐ7Ó8Ð8ÙÜÐ<Ó=Ð=àL‰LØˆ%Ð!Ð"Ø"°Ñ9Øð ó €Eð ×Ñ 
+Ñ*ÜÐ:¸5×;LÑ;LÐ:MÈRÐPU×PZÑPZÐ[^Ð\^ÐP_ÐO`ÐaÓbÐbàK‰K˜3˜%Ð2Ð3¸QˆKÓ?€EØ×Ñ˜CÒÜðØ×+Ñ+Ð,¨N¸5×;LÑ;LÐ:MÈRÐPU×PZÑPZÐ[^Ð\^ÐP_ÐO`ðbó
+ð 	
+ð
+ Cˆ<Ðr   c                 óŠ   — t        | «      \  }}|j                  |› dd¬«      }|j                  «        |j                  «       S )Nz/api/v2/torrents/infoé
+   rO   ©rZ   r5   Úraise_for_statusÚjson)rV   rW   r   Úresponses       r   Úqbit_torrentsra   V   sB   € Ü Ó)L€GˆSØ{‰{˜c˜UÐ"7Ð8À"ˆ{ÓE€HØ×ÑÔØ=‰=‹?Ðr   Útorrent_hashc                 ó˜   — |sg S t        | «      \  }}|j                  |› dd|id¬«      }|j                  «        |j                  «       S )Nz/api/v2/torrents/filesr.   r\   )ÚparamsrK   r]   )rV   rb   rW   r   r`   s        r   Úqbit_torrent_filesre   ]   s[   € ÙØˆ	ä Ó)L€GˆSØ{‰{Øˆ%Ð%Ð&Ø˜Ð%Øð ó €Hð
+ ×ÑÔØ=‰=‹?Ðr   Únamec                 óf   — t        t        | «      «      j                  j                  «       t        v S r#   )r   r   Úsuffixr%   r   )rf   s    r   Úis_video_nameri   k   s%   € Ü”D“	‹?×!Ñ!×'Ñ'Ó)Ô-=Ð=Ð=r   c           	      óÖ   — t        | |j                  dd«      «      }|D cg c]=  }t        |j                  dd«      «      r t        |j                  dd«      «      dk\  r|‘Œ? c}S c c}w )Nr.   r   rf   Úprogressr   é   )re   r5   ri   Úfloat)rV   ÚtorrentÚfilesÚfs       r   Úcompleted_video_filesrq   o   sh   € Ü˜x¨¯©°V¸RÓ)@ÓA€EáóÙˆaÜ˜Ÿ™˜v rÓ*Ô+Ü!—%‘%˜
+ AÓ&Ó'¨1Ò,ò 	
+5ñð ùò s   ¡AA&c                 ó®  — g }| D ]:  }t        |«      j                  }t        |«      dkD  sŒ'|j                  |d d «       Œ< |syt	        |d   «      }|dd  D ]g  }d}|t        t        |«      t        |«      «      k  r=||   ||   k(  r2|dz  }|t        t        |«      t        |«      «      k  r||   ||   k(  rŒ2|d | }Œi |rt        t        |Ž «      S dS )Nrl   éÿÿÿÿr   r   )r   ÚpartsÚlenÚappendÚlistÚminr   )ÚpathsÚclean_partsr   rt   ÚcommonÚis         r   Úfind_common_rootr}   x   sâ   € Ø€KÛˆÜQ“—‘ˆÜˆu‹:˜‹>Ø×Ñ˜u S b˜zÕ*ð ñ
+ Øä+˜a‘.Ó!€FØ˜Q˜R“ˆØˆØ”#”c˜&“k¤3 u£:Ó.Ò.°6¸!±9ÀÀaÁÒ3HØ‰FˆAð ”#”c˜&“k¤3 u£:Ó.Ò.°6¸!±9ÀÀaÁÓ3Hà˜˜‰ð	 !ñ "(Œ3ŒtVˆ}ÓÐ/¨RÐ/r   c           
+      óú  — t        |j                  d«      xs d«      }t        |j                  d«      xs d«      }|j                  d«      xs d}|D cg c]&  }|j                  d«      sŒ|j                  dd«      ‘Œ( }}t        |«      }g }	|r|	j                  t	        |«      «       |r|r|	j                  t	        |«      |z  «       |r|r|	j                  t	        |«      |z  «       |r.t        |«      dk(  r |	j                  t	        |«      |d   z  «       t        «       }
+|	D ]A  }t	        |«      }|j                  «       r|j                  }t        |«      j                  d«      t        t        «      j                  d«      k(  rŒet        |«      }||
+v rŒu|
+j                  |«       |j                  «       sŒ—g }|D ]‡  }t	        |j                  dd«      «      j                  }t        |j!                  |«      «      }|j#                  |D cg c]+  }|j                  «       sŒt%        |j                  «      sŒ*|‘Œ- c}«       Œ‰ |sŒ)|t'        t        |«      d„ ¬	«      fc S  d g fS c c}w c c}w )
+NÚ	save_pathr   Úcontent_pathrf   rl   r   r   c                 ó4   — t        | «      j                  «       S r#   )r   r%   )r   s    r   Ú<lambda>z&resolve_video_source.<locals>.<lambda>»   s   € ÄÀQÃÇÁÄr   ©r8   )r   r5   r}   rv   r   ru   r0   Úis_fileÚparentr   r   r   r2   Úexistsrf   rw   ÚrglobÚextendri   Úsorted)rV   rn   Úvideo_filesr   r€   rf   ÚvfÚvideo_namesÚcommon_rootr>   Úseenr?   r8   ÚmatchedÚ	qbit_nameÚpossibler   s                    r   Úresolve_video_sourcer’   Œ   s   € Ü% g§k¡k°+Ó&>Ò&DÀ"ÓE€IÜ(¨¯©°^Ó)DÒ)JÈÓK€LØ;‰;vÓÒ$ "€Dá0;ÓN±¨"¸r¿v¹vÀf½~2—6‘6˜& "Õ%°€KÐNÜ" ;Ó/€Kà€JáØ×Ñœ$˜|Ó,Ô-á‘[Ø×Ñœ$˜y›/¨KÑ7Ô8á‘TØ×Ñœ$˜y›/¨DÑ0Ô1á”S˜Ó%¨Ò*Ø×Ñœ$˜y›/¨K¸©NÑ:Ô;ä‹5€DÜˆ	Ü˜“Oˆ	à×ÑÔØ!×(Ñ(ˆIäˆy‹>× Ñ  Ó%¬¬^Ó)<×)CÑ)CÀCÓ)HÒHØä)‹nˆØ$‰;ØØ‰Œà×ÑÔ!ØàˆÛˆBÜ˜RŸV™V F¨BÓ/Ó0×5Ñ5ˆIÜ˜IŸO™O¨IÓ6Ó7ˆHØN‰N¡xÓY¡x !°1·9±9µ;Ä=ÐQR×QWÑQWÕCXšA xÑYÕZð ó
+ Øœf¤S¨£\Ñ7OÔPÐPÒPð1  ð4 ˆ8€OùòY OùòN Zs   ÁI3Á-I3ÈI8È,I8ÉI8c            	      ó@  — t        «       } 	 t        d¬«      }|D ]p  }|j                  d«      dk(  rŒdD ]T  }|j                  |d«      }|sŒ| j	                  t        |«      «       | j	                  t        t        |«      «      «       ŒV Œr | S # t        $ r | cY S w xY w)Niô  )ÚlimitÚtypeÚerror)Útitler/   r,   r-   r.   r   )r0   r   Ú	Exceptionr5   r2   r*   r   )r7   ÚhistoryÚitemr:   r    s        r   Úhistory_import_keysr›   À   s   € Ü‹5€DðÜ SÔ)ˆó ˆØ8‰8FÓ˜wÒ&ØãMˆEØ—H‘H˜U BÓ'ˆEÚØ—‘Ô-¨eÓ4Ô5Ø—‘Ô-Ô.CÀEÓ.JÓKÕLñ	 Nð	 ð €Køô ò ØŠðús   ŒB ÂBÂBr—   ÚyearÚsource_pathÚhistory_keysÚ
+media_typeÚseasonc                 ó
+  ‡— t        |«      }t        |«      }t        | «      }	t        |› d|› j                  «       «      }
+t        |xs d«      j                  d«      }t        d|› «      |j	                  «       rt        dt        |«      › «      ndt        d|› «      h}|D ]\  Š‰sŒ|dk(  r7|xr |‰v xs |	xr |	‰v xs |xr |‰v }t        ˆfd„|D «       «      }|r|r yŒB||
+|	|g}|D ]  }|sŒ|‰v s‰|v sŒ  y Œ^ y	)
+NÚ r   é   zSeason ÚSÚtvc              3   ó.   •K  — | ]  }|xr |‰v –— Œ y ­wr#   © )r&   Útokenr8   s     €r   r(   z(imported_from_history.<locals>.<genexpr>ï   s   øè ø€ ÐQÁ=¸%˜uÒ5¨°#¨Ó5Á=ùs   ƒTF)r*   r   r   ÚzfillÚisdigitÚintÚany)rf   r—   rœ   r   rž   rŸ   r    Únormalized_sourceÚnormalized_titleÚnormalized_nameÚnormalized_year_titleÚ
+season_numÚseason_tokensÚtitle_matchÚseason_matchr>   r?   r8   s                    @r   Úimported_from_historyrµ   Õ   sI  ø€ Ü,¨[Ó9ÐÜ+¨EÓ2ÐÜ*¨4Ó0€OÜ0°E°7¸!¸D¸6Ð1B×1HÑ1HÓ1JÓKÐäV’\˜rÓ"×(Ñ(¨Ó+€Jä˜w z lÐ3Ó4Ø=G×=OÑ=OÔ=QÔ˜w¤s¨:£Ð&7Ð8Ô9ÐWYÜ˜q  Ð-Ó.ð€Mó ˆÙØà˜Òà Ò<Ð%5¸Ð%<òð  Ò: O°sÐ$:òð
+ "Ò>Ð&7¸3Ð&>ð ô ÓQÁ=ÓQÓQˆLá™|Ùàà'Ð)>ÀÐQaÐbˆ
+Û#ˆIÚ˜i¨3Ñ.°#¸Ò2BÚñ $ð+ ð2 r   c                 ó´  — t        | «      }t        «       }t        «       }g }|D ]$  }t        |j	                  dd«      «      dk  rŒ#t        | |«      }|sŒ2t        | ||«      \  }}|r|sŒG|j	                  d|j                  «      }	t        |	t        |«      «      }
+|j	                  dd«      }|xs t        |«      }t        |	«      }t        |	«      }t        |	«      }||t        |«      t        t        |«      «      t        |j	                  d«      xs d«      t        |j	                  d«      xs d«      |	h}t        ||«      xs t!        |	||t        |«      ||
+|¬	«      }|j#                  i d|	“d
+t        |«      “dt        |«      “d|
+“d|
+dk(  rdnd“d|
+dk(  rdnd“d|“d|“d|“dd“dd“d|“d|“d|“d|j	                  dd«      “dt%        t        |j	                  dd«      «      d«      “d |j	                  d d«      “|j	                  d!d«      |j	                  d"d«      t'        |j	                  d#d«      «      d$œ¥«       Œ' t)        |d%„ ¬&«      S )'Nrk   r   rl   rf   r.   r   r€   r   )rf   r—   rœ   r   rž   rŸ   r    ÚpathÚvideo_countr•   Úiconr¥   u   ðŸ“ºu   ðŸŽ¬Ú
+type_labelzTV ShowÚMovier—   rœ   r    ÚmodifiedÚqBittorrentÚsource_kindrn   r-   ÚimportedÚstateÚratior£   ÚtrackerÚcategoryÚtagsÚsize)rÃ   rÄ   rÅ   c                 ó2   — | d   | d   j                  «       fS )Nr¿   rf   )r%   )Úxs    r   r‚   z&qbit_completed_items.<locals>.<lambda>D  s   € ¨¨*©°q¸±y·±Ó7HÑ'Ir   rƒ   )ra   r   r›   rm   r5   rq   r’   rf   r   ru   r   r	   r
+   r   r   rB   rµ   rv   Úroundr«   r‰   )rV   Útorrentsr6   rž   r1   rn   rŠ   r   Úvideosrf   rŸ   rb   r8   r—   rœ   r    Úimport_candidatesr¿   s                     r   Úqbit_completed_itemsrÌ   þ   sË  € Ü˜XÓ&€HÜ	Ó	€BÜ&Ó(€LØ€EäˆÜ—‘˜Z¨Ó+Ó,¨qÒ0Øä+¨H°gÓ>ˆáØä2°8¸WÀkÓRÑˆVÙ¡&Øà{‰{˜6 ;×#3Ñ#3Ó4ˆÜ ¤c¨&£kÓ2ˆ
+Ø—{‘{ 6¨2Ó.ˆØÒ.œc +Ó.ˆÜ# DÓ)ˆÜ˜4Ó ˆÜ˜tÓ$ˆð ØÜÓÜ!¤# kÓ"2Ó3Ü! '§+¡+¨nÓ"=Ò"CÀÓDÜ! '§+¡+¨kÓ":Ò"@¸bÓAØð
+Ðô $ BÐ(9Ó:ò 
+Ô>SØØØÜ˜KÓ(Ø%Ø!Øô?
+ˆð 	‰ð 
+ØDð
+à”C˜Ó$ð
+ð œ3˜v›;ð
+ð Jð	
+ð
+ ˜j¨DÒ0‘F°fð
+ð  z°TÒ'9™)¸wð
+ð Uð
+ð Dð
+ð fð
+ð ˜ð
+ð ˜9ð
+ð ˜#ð
+ð ˜ð
+ð Lð
+ð W—[‘[ ¨"Ó-ð
+ð  ”Uœ5 §¡¨W°aÓ!8Ó9¸1Ó=ð!
+ð" w—{‘{ 9¨bÓ1ð#
+ð$  Ÿ™ J°Ó3Ø—K‘K ¨Ó+Ü˜Ÿ™ F¨AÓ.Ó/ò)
+ö 	ðS ô@ %ÑIÔJÐJr   c                 ó@   — t        | «      }t        d„ |D «       «      }|S )Nc              3   ó^   K  — | ]%  }t        |j                  d d«      «      dk\  sŒ"d–— Œ' y­w)rk   r   rl   N)rm   r5   )r&   Úts     r   r(   ztest_qbit.<locals>.<genexpr>I  s(   è ø€ ÐL™x˜!¬5°·±°zÀ1Ó1EÓ+FÈ!Ó+K”A™xùs   ‚#-¦-)ra   Úsum)rV   rÉ   Ú	completeds      r   Ú	test_qbitrÒ   G  s"   € Ü˜XÓ&€HÜÑL™xÓLÓL€IØÐr   )r   r   )!Úpathlibr   rP   Ú
+app.configr   r   Úapp.services.storager   r   Úapp.services.utilsr   r	   r
+   r   r   r   r   r*   r<   rB   rZ   ra   re   Úboolri   rq   r}   r’   r›   r0   rµ   rÌ   rÒ   r§   r   r   Ú<module>rØ      sò   ðÝ Û ç 7ß =ß ZÓ Zð Cð ¨Có ð ð ¨ó ðJ ð J¨ó Jò"ò	òò<ð¨só ð>˜ð > ó >òò0ò(1òhñ*& ð &¨Cð &°sð &Èð &Ð\_ð &Ðmpð &ð  @Cð &ð  MQó &òRFKóRr   
+
+
+===== FILE: app\services\__pycache__\queue.cpython-312.pyc =====
+Ë
+    ÁïBj	  ã                   ó€   — d dl mZ d dlmZ d dlmZmZ d dlmZmZm	Z	m
+Z
+mZ d dlmZmZ d dlmZmZmZmZmZ d„ Zd„ Zy	)
+é    )ÚPath)Údatetime)ÚDOWNLOADS_ROOTÚIGNORE_NAMES)Úfind_videosÚ
+guess_typeÚstrip_release_wordsÚdetect_yearÚdetect_season)Úload_import_dbÚread_history)Úqbit_completed_itemsÚnormalize_source_pathÚimported_from_dbÚimported_from_historyÚhistory_import_keysc            
+      óÌ  — g } t        «       }t        «       }t        j                  «       s| S t	        t        j
+                  «       d„ d¬«      D ]’  }|j                  «       r |j                  j                  «       t        v rŒ5t        |«      }|sŒCt        |j                  t        |«      «      }|j                  «       }t        |«      }t        |j                  «      }t!        |j                  «      }	t#        |j                  «      }
+t%        ||t'        |«      |j                  h«      xs t)        |j                  ||	||||
+¬«      }| j+                  i d|j                  “dt        |«      “dt        |«      “d|“d	|d
+k(  rdnd“d|d
+k(  rdnd“d|“d|	“d|
+“dt-        j.                  |j0                  «      j3                  d«      “dd“d|“d|“dd“dd“dd“«       Œ• | S )Nc                 óZ   — | j                  «       r| j                  «       j                  S dS )Nr   )ÚexistsÚstatÚst_mtime)Úxs    úapp\services\queue.pyÚ<lambda>zfolder_items.<locals>.<lambda>   s%   € ÐQR×QYÑQYÔQ[¸A¿F¹F»H×<MÑ<MÐ<bÐabÐ<bó    T)ÚkeyÚreverse)ÚnameÚtitleÚyearÚsource_pathÚhistory_keysÚ
+media_typeÚseasonr   ÚpathÚvideo_countÚtypeÚiconÚtvu   ðŸ“ºu   ðŸŽ¬Ú
+type_labelzTV ShowÚMovier   r    r$   Úmodifiedz%Y-%m-%d %H:%MÚsource_kindÚfolderÚ
+source_keyÚimportedÚhashÚ ÚstateÚratio)r   r   r   r   ÚsortedÚiterdirÚis_dirr   Úlowerr   r   r   Úlenr   Ústrr	   r
+   r   r   r   r   Úappendr   Úfromtimestampr   Ústrftime)ÚfoldersÚdbr"   ÚpÚvideosr#   r   r   r   r    r$   r0   s               r   Úfolder_itemsrB   
+   s&  € Ø€GÜ	Ó	€BÜ&Ó(€Lä× Ñ Ô"Øˆä”N×*Ñ*Ó,Ñ2bÐlp×qÐqˆØx‰xŒz˜QŸV™VŸ\™\›^¬|Ñ;Øä˜Q“ˆÙØä §¡¬¨F«Ó4ˆ
+Øv‰v‹xˆÜ!‹fˆÜ# A§F¡FÓ+ˆÜ˜1Ÿ6™6Ó"ˆÜ˜qŸv™vÓ&ˆä# BØÜ! #Ó&ØF‰Fð)
+ó ò 
+ô $Ø—‘ØØØØ%Ø!Øô
+ð	 	ð 	‰ð 
+ØA—F‘Fð
+à”C˜“Fð
+ð œ3˜v›;ð
+ð Jð	
+ð
+ ˜j¨DÒ0‘F°fð
+ð  z°TÒ'9™)¸wð
+ð Uð
+ð Dð
+ð fð
+ð œ×.Ñ.¨t¯}©}Ó=×FÑFÐGWÓXð
+ð ˜8ð
+ð ˜#ð
+ð ˜ð
+ð Bð
+ð Rð
+ð  Rð!
+ö 	ð; rð` €Nr   c                 ó¬   — | j                  d«      r	 t        | «      }|dd fS t        «       dd fS # t        $ r}t        «       dd|› fcY d }~S d }~ww xY w)NÚqbittorrent_enabledÚqBittorrentÚFolderszqBittorrent error: )Úgetr   Ú	ExceptionrB   )ÚsettingsÚitemsÚes      r   Úqueue_itemsrL   E   sh   € Ø‡||Ð)Ô*ð	HÜ(¨Ó2ˆEØ˜-¨Ð-Ð-ô ‹>˜9 dÐ*Ð*øô ò 	HÜ“> 9Ð0CÀAÀ3Ð.GÐGÕGûð	Hús   “0 °	A¹AÁAÁAN)Úpathlibr   r   Ú
+app.configr   r   Úapp.services.utilsr   r   r	   r
+   r   Úapp.services.storager   r   Úapp.services.qbittorrentr   r   r   r   r   rB   rL   © r   r   Ú<module>rS      s.   ðÝ Ý ç 3ß gÕ gß =÷ Oõ  Oò8óv+r   
+
+
+===== FILE: app\services\__pycache__\storage.cpython-312.pyc =====
+Ë
+    @ÛAj÷  ã            	       óh   — d dl Z d dlmZmZmZ dddddddddœZd„ Zd„ Zd	„ Zd
+„ Z	d„ Z
+d„ Zd„ Zdd„Zy)é    N)ÚHISTORY_FILEÚIMPORT_DB_FILEÚSETTINGS_FILEFÚ T)Úqbittorrent_enabledÚqbittorrent_urlÚqbittorrent_usernameÚqbittorrent_passwordÚtmdb_api_keyÚjellyfin_urlÚjellyfin_api_keyÚdeveloper_modec                 ó  — | j                  «       s"t        |t        «      r|j                  «       S |S 	 t	        j
+                  | j                  d¬«      «      S # t        $ r' t        |t        «      r|j                  «       cY S |cY S w xY w©Núutf-8©Úencoding)ÚexistsÚ
+isinstanceÚdictÚcopyÚjsonÚloadsÚ	read_textÚ	Exception)ÚpathÚdefaults     úapp\services\storage.pyÚ	load_jsonr      sp   € Ø;‰;Œ=Ü!+¨G´TÔ!:ˆw|‰|‹~ÐGÀÐGðHÜz‰z˜$Ÿ.™.°'˜.Ó:Ó;Ð;øÜò HÜ!+¨G´TÔ!:ˆw|‰|‹~ÒGÀÒGðHús   ´$A Á)B	ÂB	ÂB	c                 óT   — | j                  t        j                  |d¬«      d¬«       y )Né   )Úindentr   r   )Ú
+write_textr   Údumps)r   Údatas     r   Ú	save_jsonr&      s   € Ø‡OO”D—J‘J˜t¨AÔ.¸€OÕAó    c                  ól   — t         j                  «       } | j                  t        t        i «      «       | S ©N)ÚDEFAULT_SETTINGSr   Úupdater   r   )r%   s    r   Úload_settingsr,      s(   € Ü× Ñ Ó"€DØ‡KK”	œ-¨Ó,Ô-Ø€Kr'   c                 ón   — t         j                  «       }|j                  | «       t        t        |«       y r)   )r*   r   r+   r&   r   )r%   Úcleaneds     r   Úsave_settingsr/      s&   € Ü×#Ñ#Ó%€GØ‡NN4ÔÜŒm˜WÕ%r'   c                  ó"   — t        t        i «      S r)   )r   r   © r'   r   Úload_import_dbr2   $   s   € Ü”^ RÓ(Ð(r'   c                 ó$   — t        t        | «       y r)   )r&   r   )Údbs    r   Úsave_import_dbr5   '   s   € ÜŒn˜bÕ!r'   c                 óª   — t        j                  dd¬«      5 }|j                  t        j                  | «      dz   «       d d d «       y # 1 sw Y   y xY w)NÚar   r   Ú
+)r   ÚopenÚwriter   r$   )ÚentryÚfs     r   Úappend_historyr=   *   s:   € Ü	×	Ñ	˜3¨Õ	1°QØ	‰”—
+‘
+˜5Ó! DÑ(Ô)÷ 
+2×	1Ñ	1ús   ˜(A	Á	Ac                 ó  — t        j                  «       sg S t        j                  d¬«      j                  «       }g }t	        ||  d  «      D ]'  }	 |j                  t        j                  |«      «       Œ) |S # t        $ r Y Œ7w xY wr   )	r   r   r   Ú
+splitlinesÚreversedÚappendr   r   r   )ÚlimitÚlinesÚoutÚlines       r   Úread_historyrF   .   s}   € Ü×ÑÔ Øˆ	Ü×"Ñ"¨GÔ4×?Ñ?ÓA€EØ
+€CÜ˜ ˜v˜w˜Ö(ˆð	ØJ‰J”t—z‘z $Ó'Õ(ð )ð
+ €Jøô ò 	Ùð	ús   Á$A8Á8	BÂB)é   )r   Ú
+app.configr   r   r   r*   r   r&   r,   r/   r2   r5   r=   rF   r1   r'   r   Ú<module>rI      sZ   ðÛ ß BÑ Bð !ØØØØØØØñ	Ð òHòBòò
+&ò
+)ò"ò*ô
+r'   
+
+
+===== FILE: app\services\__pycache__\tmdb.cpython-312.pyc =====
+Ë
+    bÄAje
+  ã                   ó(   — d dl Z ddededefd„Zd„ Zy)é    NÚ
+media_typeÚtitleÚyearc                 ó  — | j                  dd«      j                  «       }|r|sy|dk(  rdnd}d|› }||ddd	d
+œ}|r|dk(  r||d<   n||d<   	 t        j                   ||d¬«      }|j                  «        |j	                  «       j                  dg «      }	|	sn|rl|j                  dd«       |j                  dd«       t        j                   ||d¬«      }|j                  «        |j	                  «       j                  dg «      }	|	sy|	d   }
+|
+j                  d«      }|
+j                  d«      }|
+j                  d«      xs |
+j                  d«      xs d}|
+j                  d«      ||
+j                  d«      xs |
+j                  d«      xs ||dd |
+j                  dd«      |rd|› nd|rd|› ndt        t        |
+j                  dd«      «      d	«      t        |
+j                  dd«      «      dœ	S # t        $ r Y yw xY w)zf
+    Search TMDb for a movie or TV show.
+
+    Returns a small normalized metadata object or None.
+    Útmdb_api_keyÚ NÚtvÚmoviez$https://api.themoviedb.org/3/search/Úfalsezen-USé   )Úapi_keyÚqueryÚinclude_adultÚlanguageÚpageÚfirst_air_date_yearr   é   ©ÚparamsÚtimeoutÚresultsr   Úposter_pathÚbackdrop_pathÚfirst_air_dateÚrelease_dateÚidÚnamer   é   Úoverviewzhttps://image.tmdb.org/t/p/w342zhttps://image.tmdb.org/t/p/w780Úvote_averageÚ
+vote_count)	r   r   r   r   r   ÚposterÚbackdropÚscoreÚvotes)
+ÚgetÚstripÚrequestsÚraise_for_statusÚjsonÚpopÚroundÚfloatÚintÚ	Exception)Úsettingsr   r   r   r   ÚendpointÚurlr   Úresponser   Úitemr   r   r   s                 ú3C:\Projects\nasdy-media-linker\app\services\tmdb.pyÚtmdb_searchr6      s  € ð l‰l˜>¨2Ó.×4Ñ4Ó6€GÙ™%Øà! TÒ)‰t¨w€HØ0°°
+Ð
+;€Cð ØØ ØØñ€Fñ Ø˜ÒØ,0ˆFÐ(Ò)à!ˆF6‰Nð!Ü—<‘< ¨F¸AÔ>ˆØ×!Ñ!Ô#Ø—-‘-“/×%Ñ% i°Ó4ˆá™4àJ‰JÐ,¨dÔ3ØJ‰Jv˜tÔ$Ü—|‘| C°ÀÔBˆHØ×%Ñ%Ô'Ø—m‘m“o×)Ñ)¨)°RÓ8ˆGáØàq‰zˆØ—h‘h˜}Ó-ˆØŸ™ Ó1ˆØ—x‘xÐ 0Ó1ÒS°T·X±X¸nÓ5MÒSÐQSˆð —(‘(˜4“.Ø$Ø—X‘X˜fÓ%ÒC¨¯©°'Ó):ÒC¸eØ   !Ð$ØŸ™ ¨RÓ0ÙITÐ7¸°}ÑEÐZ\ÙMZÐ9¸-¸ÑIÐ`bÜœ5 §¡¨.¸!Ó!<Ó=¸qÓAÜ˜Ÿ™ ,°Ó2Ó3ñ
+
+ð 
+	
+øô ò Ùðús   ÁB:G7 Ä
+C,G7 Ç7	HÈHc                 ó   — | j                  dd«      j                  «       }|st        d«      ‚t        j                   dd|id¬«      }|j                  dk7  r(t        d	|j                  › d
+|j
+                  dd › «      ‚y)zJ
+    Validate the TMDb API key by calling the configuration endpoint.
+    r   r   zTMDb API key is required.z*https://api.themoviedb.org/3/configurationr   r   r   éÈ   zTMDb connection failed. HTTP z: Néd   T)r&   r'   Ú
+ValueErrorr(   Ústatus_codeÚtext)r0   r   r3   s      r5   Ú	test_tmdbr=   C   sŒ   € ð l‰l˜>¨2Ó.×4Ñ4Ó6€GÙÜÐ4Ó5Ð5ä|‰|Ø4Ø˜7Ð#Øô€Hð ×Ñ˜sÒ"ÜÐ8¸×9MÑ9MÐ8NÈbÐQY×Q^ÑQ^Ð_cÐ`cÐQdÐPeÐfÓgÐgàó    )r   )r(   Ústrr6   r=   © r>   r5   Ú<module>rA      s(   ðÛ ñ< cð <°#ð <¸Só <ó~r>   
+
+
+===== FILE: app\services\__pycache__\utils.cpython-312.pyc =====
+Ë
+    @ÛAj‰
+  ã                   óÈ   — d dl Z d dlmZ d dlmZmZ dedefd„Zdedefd„Zdedefd„Z	dedefd	„Z
+dedefd
+„Zdedefd„Zdedefd„Zdedefd„Zdefd„Zdededefd„Zy)é    N)ÚPath)ÚVIDEO_EXTENSIONSÚQUALITY_WORDSÚtextÚreturnc                 ó^   — t        j                  ddt        | «      «      j                  «       S )Nz\s+Ú )ÚreÚsubÚstrÚstrip©r   s    ú4C:\Projects\nasdy-media-linker\app\services\utils.pyÚclean_spacesr      s"   € Ü6‰6&˜#œs 4›yÓ)×/Ñ/Ó1Ð1ó    c                 óœ   — t        | «      j                  dd«      j                  dd«      } t        j                  dd| «      } t	        | «      S )NÚ.r	   Ú_z\s+-\s+)r   Úreplacer
+   r   r   r   s    r   Úprettyr      sB   € Üˆt‹9×Ñ˜S #Ó&×.Ñ.¨s°CÓ8€DÜ6‰6*˜c 4Ó(€DÜ˜ÓÐr   c                 óX   — t        j                  ddt        | «      «      } t        | «      S )Nz[\\/:*?"<>|]Ú-)r
+   r   r   r   r   s    r   Ú	safe_namer      s#   € Ü6‰6/ 3¬¨D«	Ó2€DÜ˜ÓÐr   c                 ó¦  — h d£}g }t        t        | «      j                  «       «      D ]–  \  }}|j                  «       dv r |j	                  |j                  «       «       Œ8|dk7  r2|j                  «       |v r |j	                  |j                  «       «       Œo|j	                  |d d j                  «       |dd  z   «       Œ˜ dj                  |«      S )N>   ÚaÚanÚatÚbyÚinÚofÚonÚorÚtoÚandÚforÚtheÚfromÚwith>   ÚDCÚTVÚCSIÚFBIÚUHDÚUSAÚNCISr   é   r	   )Ú	enumerater   ÚsplitÚupperÚappendÚlowerÚjoin)r   ÚsmallÚoutÚiÚws        r   Útitle_case_guessr;      s¤   € ÚY€EØ
+€CÜœ#˜d›)Ÿ/™/Ó+Ö,‰ˆˆ1Ø7‰7‹9ÐHÑHØJ‰Jq—w‘w“yÕ!Ø!ŠV˜Ÿ™›	 UÑ*ØJ‰Jq—w‘w“yÕ!àJ‰Jq˜˜!u—{‘{“} q¨¨ uÑ,Õ-ð -ð 8‰8C‹=Ðr   c                 óR   — t        j                  dt        | «      «      }|r|d   S dS )Nz\b(19\d{2}|20\d{2})\br   Ú )r
+   Úfindallr   )r   Úyearss     r   Údetect_yearr@      s(   € ÜJ‰JÐ/´°T³Ó;€EÙˆ5‰8Ð$ "Ð$r   c                 ó&  — t        | «      } t        j                  d| t        j                  «      }|rt	        |j                  d«      «      d›S t        j                  d| t        j                  «      }|rt	        |j                  d«      «      d›S y)Nz\bS(\d{1,2})\br0   Ú02dz\bSeason[ ._-]*(\d{1,2})\bÚ01©r   r
+   ÚsearchÚIÚintÚgroup)r   Úms     r   Údetect_seasonrJ   !   sp   € Üˆt‹9€DÜ
+	‰	Ð# T¬2¯4©4Ó0€AÙÜa—g‘g˜a“j“/ #Ð&Ð'Ü
+	‰	Ð/°´r·t±tÓ<€AÙÜa—g‘g˜a“j“/ #Ð&Ð'Ør   Úfilenamec                 ó&  — t        | «      } t        j                  d| t        j                  «      }|rt	        |j                  d«      «      d›S t        j                  d| t        j                  «      }|rt	        |j                  d«      «      d›S y)Nz\bS\d{1,2}E(\d{1,3})\br0   rB   z\b\d{1,2}x(\d{1,3})\br=   rD   )rK   rI   s     r   Údetect_episoderM   +   sp   € Ü8‹}€HÜ
+	‰	Ð+¨X´r·t±tÓ<€AÙÜa—g‘g˜a“j“/ #Ð&Ð'Ü
+	‰	Ð*¨H´b·d±dÓ;€AÙÜa—g‘g˜a“j“/ #Ð&Ð'Ør   c                 ó  — t        | «      }t        | «      } t        j                  dd| t        j                  ¬«      } t        j                  dd| t        j                  ¬«      } t        j                  dd| «      } t
+        D ]@  }t        j                  dt        j                  |«      › dd| t        j                  ¬«      } ŒB t        j                  dd| t        j                  ¬«      } t        | «      } | rt        | «      S |S )	Nz\s+S\d{1,2}.*$r=   )Úflagsz\s+Season\s*\d{1,2}.*$z\s+\b(19\d{2}|20\d{2})\b.*$z\s+\bz\b.*$zB\[[^\]]+\]|\([^\)]*?(remux|x264|x265|hevc|web|bluray|hdr)[^\)]*?\))	r   r   r
+   r   rF   r   Úescaper   r;   )r   ÚoriginalÚwords      r   Ústrip_release_wordsrS   5   sÈ   € Ü4‹y€HÜ$‹<€DÜ6‰6Ð# R¨´R·T±TÔ:€DÜ6‰6Ð+¨R°¼R¿T¹TÔB€DÜ6‰6Ð0°"°dÓ;€DßˆÜv‰v˜œrŸy™y¨›Ð/¨uÐ5°r¸4ÄrÇtÁtÔL‰ð ä6‰6ÐWÐY[Ð]aÔik×imÑimÔn€DÜ˜Ó€DÙ%)Ô˜DÓ!Ð7¨xÐ7r   Úfolderc                 ó   — t        | «      } | j                  «       sg S t        | j                  d«      D cg c]6  }|j	                  «       sŒ|j
+                  j                  «       t        v sŒ5|‘Œ8 c}d„ ¬«      S c c}w )NÚ*c                 ó4   — t        | «      j                  «       S )N)r   r5   )Úps    r   Ú<lambda>zfind_videos.<locals>.<lambda>G   s   € ”c˜!“f—l‘l”nr   )Úkey)r   ÚexistsÚsortedÚrglobÚis_fileÚsuffixr5   r   )rT   rX   s     r   Úfind_videosr`   A   sd   € Ü&‹\€FØ=‰=Œ?Øˆ	ÜØ—L‘L Ô%Ó^Ñ%ˆq¨¯©­¸¿¹¿¹Ó9IÔM]Ò9]ŠÐ%Ñ^Ù$ôð ùÚ^s   ¶A;Á A;Á-A;ÚnameÚvideo_countc                 ón   — t        j                  dt        | «      t         j                  «      ry|dk\  ryy)Nz%\bS\d{1,2}\b|\bSeason[ ._-]*\d{1,2}\bÚtvé   Úmovie)r
+   rE   r   rF   )ra   rb   s     r   Ú
+guess_typerg   J   s,   € Ü	‡yyÐ9¼3¸t»9ÄbÇdÁdÔKØØaÒØØr   )r
+   Úpathlibr   Ú
+app.configr   r   r   r   r   r   r;   r@   rJ   rM   rS   r`   rG   rg   © r   r   Ú<module>rk      sÌ   ðÛ 	Ý ß 6ð2sð 2˜só 2ðð ˜ó ð
+Cð ˜Có ð
+˜3ð 
+ 3ó 
+ð%cð %˜có %ð˜ð  ó ð˜Sð  Só ð
+8˜cð 
+8 có 
+8ð˜ó ðSð  sð ¨sô r   
+
+
+===== FILE: app\services\__pycache__\__init__.cpython-312.pyc =====
+Ë
+    @ÛAj    ã                    ó   — y )N© r   ó    ú7C:\Projects\nasdy-media-linker\app\services\__init__.pyÚ<module>r      s   ñr   
+
+
+===== FILE: app\static\app.js =====
+const $ = (selector) => document.querySelector(selector);
+
+let previewTimer = null;
+
+function setMediaType(type) {
+  const radio = document.querySelector(`input[name="media_type"][value="${type}"]`);
+  if (radio) radio.checked = true;
+  updateSeasonVisibility();
+}
+
+function getMediaType() {
+  const checked = document.querySelector('input[name="media_type"]:checked');
+  return checked ? checked.value : "tv";
+}
+
+function getImportButton() {
+  return document.querySelector('form[action="/organize"] button[type="submit"]');
+}
+
+function setImportButton(text, disabled = false) {
+  const btn = getImportButton();
+  if (!btn) return;
+  btn.textContent = text;
+  btn.disabled = disabled;
+  btn.classList.toggle("disabled", disabled);
+}
+
+function setManualButtons(imported = false) {
+  const markBtn = $("#markImportedBtn");
+  const unmarkBtn = $("#unmarkImportedBtn");
+  if (markBtn) markBtn.classList.toggle("hidden", imported);
+  if (unmarkBtn) unmarkBtn.classList.toggle("hidden", !imported);
+}
+
+function setActionMessage(message, isError = false) {
+  const warning = $("#warning");
+  if (!warning) return;
+  warning.textContent = message || "";
+  warning.classList.toggle("bad-text", !!isError);
+}
+
+function selectedPayload() {
+  return {
+    source: $("#source")?.value || "",
+    source_key: $("#sourceKey")?.value || "",
+    media_type: getMediaType(),
+    title: $("#title")?.value || "",
+    year: $("#year")?.value || "",
+    imdb_id: $("#imdb_id")?.value || "",
+    season: $("#season")?.value || "01",
+  };
+}
+
+function updateSeasonVisibility() {
+  const seasonWrap = $("#seasonWrap");
+  if (!seasonWrap) return;
+  seasonWrap.style.display = getMediaType() === "movie" ? "none" : "block";
+}
+
+function escapeHtml(value) {
+  return String(value ?? "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#039;");
+}
+
+function schedulePreview() {
+  clearTimeout(previewTimer);
+  previewTimer = setTimeout(previewSelected, 350);
+}
+
+function fillFromCard(card) {
+  if (!card) return;
+
+  document.querySelectorAll(".folder").forEach(el => el.classList.remove("active"));
+  card.classList.add("active");
+
+  $("#source").value = card.dataset.source || "";
+  $("#sourceKey").value = card.dataset.sourceKey || card.dataset.source || "";
+  $("#title").value = card.dataset.title || "";
+  $("#year").value = card.dataset.year || "";
+  $("#season").value = card.dataset.season || "01";
+  const imdbInput = $("#imdb_id");
+  if (imdbInput) imdbInput.value = "";
+  setActionMessage("");
+  setManualButtons(card.dataset.imported === "true");
+
+  setMediaType(card.dataset.type || "tv");
+  setImportButton("Checking...", true);
+
+  $("#metadata").innerHTML = `
+    <div>
+      <h3>Import Advisor</h3>
+      <p>Checking your library and building an import plan...</p>
+    </div>
+  `;
+
+  $("#preview").innerHTML = '<div class="empty-preview">Checking import plan...</div>';
+
+  schedulePreview();
+}
+
+function renderImportAdvisor(data) {
+  const metadata = $("#metadata");
+  if (!metadata) return;
+
+  if (data.imported) {
+    const importType = data.imported.import_type || "linked";
+    const heading = importType === "manual" ? "Manually Marked Imported" : "Previously Hard Linked";
+    const verb = importType === "manual" ? "Marked" : "Linked";
+
+    setImportButton("Already Imported", true);
+    setManualButtons(true);
+
+    metadata.innerHTML = `
+      <div>
+        <h3>${escapeHtml(heading)}</h3>
+        <p>This item is already recorded in Media Linker import tracking.</p>
+        <p><strong>Destination:</strong><br>${escapeHtml(data.imported.destination || "")}</p>
+        <p><strong>${escapeHtml(verb)}:</strong> ${escapeHtml(data.imported.time || "")}</p>
+        <p><strong>Import Type:</strong> ${escapeHtml(importType)}</p>
+        <p><strong>Recommendation:</strong> No action needed.</p>
+      </div>
+    `;
+    return;
+  }
+
+  setManualButtons(false);
+
+  const match = data.library_match;
+  const mediaType = getMediaType();
+
+  if (!match) {
+    if (mediaType === "movie") {
+      setImportButton("Create New Movie", false);
+    } else {
+      setImportButton("Create New TV Folder", false);
+    }
+
+    metadata.innerHTML = `
+      <div>
+        <h3>New Library Folder</h3>
+        <p>No existing library match was found.</p>
+        <p><strong>Recommendation:</strong> Create a new destination folder.</p>
+        <p><strong>Destination:</strong><br>${escapeHtml(data.destination || "")}</p>
+      </div>
+    `;
+    return;
+  }
+
+  if (match.kind === "movie") {
+    setImportButton("Import into Existing Movie", false);
+    metadata.innerHTML = `
+      <div>
+        <h3>Existing Movie Found</h3>
+        <p><strong>${escapeHtml(match.title)}</strong></p>
+        <p>Media Linker found an existing movie folder in your library.</p>
+        <p><strong>Videos already there:</strong> ${escapeHtml(match.video_count)}</p>
+        <p><strong>Confidence:</strong> ${escapeHtml(match.confidence)} / Score ${escapeHtml(match.score)}</p>
+        <p><strong>Recommendation:</strong> Import into the existing movie folder.</p>
+        <p><strong>Path:</strong><br>${escapeHtml(match.path)}</p>
+      </div>
+    `;
+    return;
+  }
+
+  const episodes = Array.isArray(match.existing_episodes) && match.existing_episodes.length
+    ? match.existing_episodes.map(e => String(e).padStart(2, "0")).join(", ")
+    : "None detected";
+
+  setImportButton(`Import into Season ${match.season}`, false);
+
+  metadata.innerHTML = `
+    <div>
+      <h3>Existing Show Found</h3>
+      <p><strong>${escapeHtml(match.title)}</strong></p>
+      <p>Media Linker found this show in your TV library.</p>
+      <p><strong>Season ${escapeHtml(match.season)}:</strong> ${match.season_exists ? "Exists" : "Not found yet"}</p>
+      <p><strong>Episodes already there:</strong> ${escapeHtml(episodes)}</p>
+      <p><strong>Confidence:</strong> ${escapeHtml(match.confidence)} / Score ${escapeHtml(match.score)}</p>
+      <p><strong>Recommendation:</strong> Import into the existing show/season folder.</p>
+      <p><strong>Path:</strong><br>${escapeHtml(match.season_path || match.path)}</p>
+    </div>
+  `;
+}
+
+function renderPreview(data) {
+  const preview = $("#preview");
+  if (!preview) return;
+
+  if (!data.ok) {
+    setImportButton("Import Unavailable", true);
+    preview.innerHTML = `<div class="empty-preview bad-text">${escapeHtml(data.error || "Preview failed")}</div>`;
+    return;
+  }
+
+  const rows = (data.items || []).map(item => `
+    <tr>
+      <td>${escapeHtml(item.src)}</td>
+      <td>${escapeHtml(item.new_name || item.dst)}</td>
+      <td>${item.exists ? '<span class="exists">Exists</span>' : '<span class="good-text">Ready</span>'}</td>
+    </tr>
+  `).join("");
+
+  preview.innerHTML = `
+    <div class="destination"><strong>Destination:</strong><br>${escapeHtml(data.destination || "")}</div>
+    <table class="preview-table">
+      <thead>
+        <tr>
+          <th>Original</th>
+          <th>New filename</th>
+          <th>Status</th>
+        </tr>
+      </thead>
+      <tbody>${rows}</tbody>
+    </table>
+  `;
+}
+
+function renderDiagnostics(data) {
+  const diag = $("#diagnostics");
+  if (!diag) return;
+  diag.textContent = JSON.stringify(data.diagnostics || [], null, 2);
+}
+
+async function previewSelected() {
+  const payload = selectedPayload();
+
+  if (!payload.source) return;
+
+  const response = await fetch("/api/preview", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload)
+  });
+
+  const data = await response.json();
+
+  renderImportAdvisor(data);
+  renderPreview(data);
+  renderDiagnostics(data);
+}
+
+async function postJson(url, payload) {
+  const response = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload)
+  });
+  return await response.json();
+}
+
+async function markSelectedImported() {
+  const payload = selectedPayload();
+  if (!payload.source) {
+    setActionMessage("Select a queue item first.", true);
+    return;
+  }
+
+  const btn = $("#markImportedBtn");
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = "Marking...";
+  }
+
+  const data = await postJson("/api/imports/mark", payload);
+  if (!data.ok) {
+    setActionMessage(data.error || "Could not mark this item imported.", true);
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = "âœ“ Mark Imported";
+    }
+    return;
+  }
+
+  setActionMessage("Marked imported. Refreshing queue...");
+  window.location.reload();
+}
+
+async function unmarkSelectedImported() {
+  const payload = selectedPayload();
+  if (!payload.source) {
+    setActionMessage("Select a queue item first.", true);
+    return;
+  }
+
+  const btn = $("#unmarkImportedBtn");
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = "Unmarking...";
+  }
+
+  const data = await postJson("/api/imports/unmark", payload);
+  if (!data.ok) {
+    setActionMessage(data.error || "Could not unmark this item.", true);
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = "Unmark Imported";
+    }
+    return;
+  }
+
+  setActionMessage("Import mark removed. Refreshing queue...");
+  window.location.reload();
+}
+
+document.addEventListener("DOMContentLoaded", () => {
+  document.querySelectorAll(".folder").forEach(card => {
+    card.addEventListener("click", () => fillFromCard(card));
+  });
+
+  document.querySelectorAll('input[name="media_type"]').forEach(radio => {
+    radio.addEventListener("change", () => {
+      updateSeasonVisibility();
+      schedulePreview();
+    });
+  });
+
+  ["#title", "#year", "#season", "#imdb_id"].forEach(selector => {
+    const el = $(selector);
+    if (el) el.addEventListener("input", schedulePreview);
+  });
+
+  const previewBtn = $("#previewBtn");
+  if (previewBtn) previewBtn.style.display = "none";
+
+  const markBtn = $("#markImportedBtn");
+  if (markBtn) markBtn.addEventListener("click", markSelectedImported);
+
+  const unmarkBtn = $("#unmarkImportedBtn");
+  if (unmarkBtn) unmarkBtn.addEventListener("click", unmarkSelectedImported);
+
+  const first = document.querySelector('.torrent-card[data-imported="false"]')
+    || document.querySelector(".torrent-card")
+    || document.querySelector(".folder");
+
+  if (first) fillFromCard(first);
+
+  updateSeasonVisibility();
+});
+
+
+
+===== FILE: app\static\settings.js =====
+const $ = (sel) => document.querySelector(sel);
+
+document.addEventListener("DOMContentLoaded", () => {
+  const qbitBtn = $("#testQbit");
+  if (qbitBtn) {
+    qbitBtn.addEventListener("click", async () => {
+      $("#testResult").textContent = "Testing...";
+      const payload = {
+        qbittorrent_url: $("#qbittorrent_url").value,
+        qbittorrent_username: $("#qbittorrent_username").value,
+        qbittorrent_password: $("#qbittorrent_password").value,
+      };
+      const res = await fetch("/api/qbit/test", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify(payload)
+      });
+      const data = await res.json();
+      $("#testResult").textContent = data.message;
+      $("#testResult").className = data.ok ? "good-text" : "bad-text";
+    });
+  }
+
+  const tmdbBtn = $("#testTmdb");
+  if (tmdbBtn) {
+    tmdbBtn.addEventListener("click", async () => {
+      $("#tmdbTestResult").textContent = "Testing...";
+      const payload = {
+        tmdb_api_key: $("#tmdb_api_key").value,
+      };
+      const res = await fetch("/api/tmdb/test", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify(payload)
+      });
+      const data = await res.json();
+      $("#tmdbTestResult").textContent = data.message;
+      $("#tmdbTestResult").className = data.ok ? "good-text" : "bad-text";
+    });
+  }
+});
+
+
+
+===== FILE: app\static\style.css =====
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  background: radial-gradient(circle at top left, #172033, #0f1117 38%);
+  color: #f5f7fb;
+  font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+}
+.shell { max-width: 1540px; margin: 0 auto; padding: 34px 22px; }
+.shell.narrow { max-width: 900px; }
+.hero { display: flex; justify-content: space-between; gap: 18px; align-items: flex-start; margin-bottom: 22px; }
+h1 { margin: 0 0 8px; font-size: 42px; letter-spacing: -1px; }
+h2 { margin-top: 0; }
+h3 { margin-top: 22px; }
+p { color: #b8bfcc; }
+.section-subtitle { margin: -6px 0 0; font-size: 13px; }
+.hero-actions { display: flex; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
+.badge, .pill, .navlink {
+  background: #1f6feb;
+  padding: 8px 12px;
+  border-radius: 999px;
+  font-weight: 800;
+  color: white;
+  text-decoration: none;
+}
+.pill { background: #2a2f3b; color: #c8cfdb; }
+.pill.good { background: #12351e; color: #85f0a3; border: 1px solid #2dbd6e; }
+.navlink { background: #2a2f3b; }
+.layout { display: grid; grid-template-columns: 0.95fr 1.25fr 0.8fr; gap: 18px; }
+.card {
+  background: rgba(25, 28, 36, 0.96);
+  border: 1px solid #313644;
+  border-radius: 18px;
+  padding: 20px;
+  min-width: 0;
+  box-shadow: 0 18px 50px rgba(0,0,0,.24);
+}
+.card-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; }
+.card-head span { color: #aeb6c5; font-weight: 800; white-space: nowrap; }
+.search { margin: 0 0 12px; }
+.queue-tabs {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 8px;
+  margin: 14px 0 12px;
+}
+.queue-tab {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 6px;
+  padding: 9px 10px;
+  border: 1px solid #343a49;
+  background: #10141d;
+  color: #cfd6e3;
+  border-radius: 12px;
+  font-weight: 900;
+  cursor: pointer;
+}
+.queue-tab span {
+  background: #242a37;
+  color: #aeb6c5;
+  border-radius: 999px;
+  padding: 2px 7px;
+  font-size: 12px;
+}
+.queue-tab.active {
+  border-color: #2dbd6e;
+  background: #12351e;
+  color: #85f0a3;
+}
+.queue-tab.active span {
+  background: #0d2514;
+  color: #85f0a3;
+}
+.queue-empty {
+  margin-top: 12px;
+  padding: 14px;
+  border: 1px dashed #3d4351;
+  border-radius: 12px;
+  color: #aeb6c5;
+  text-align: center;
+}
+.folder-list { display: grid; gap: 12px; max-height: 68vh; overflow: auto; padding-right: 4px; }
+.folder {
+  text-align: left;
+  padding: 0;
+  border: 1px solid #343a49;
+  background: #11141b;
+  color: #f5f7fb;
+  border-radius: 16px;
+  cursor: pointer;
+  overflow: hidden;
+}
+.folder:hover, .folder.active {
+  border-color: #2dbd6e;
+  background: linear-gradient(135deg, #142018, #11141b 72%);
+}
+.folder.imported { opacity: .62; }
+.torrent-card { display: block; padding: 15px; position: relative; }
+.torrent-card::before {
+  content: "";
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 4px;
+  background: #2dbd6e;
+  opacity: .9;
+}
+.torrent-card.imported::before { background: #6e8cff; }
+.torrent-topline {
+  display: grid;
+  grid-template-columns: 30px minmax(0, 1fr);
+  gap: 10px;
+  align-items: start;
+  margin-bottom: 8px;
+}
+.torrent-icon {
+  width: 30px;
+  height: 30px;
+  display: grid;
+  place-items: center;
+  border-radius: 10px;
+  background: #202634;
+  font-size: 16px;
+  line-height: 1;
+}
+.torrent-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 8px;
+  min-width: 0;
+}
+.folder-title {
+  display: block;
+  font-weight: 950;
+  line-height: 1.18;
+  overflow-wrap: anywhere;
+}
+.year-pill {
+  flex: 0 0 auto;
+  background: #0c1119;
+  border: 1px solid #2b303d;
+  border-radius: 999px;
+  color: #aeb6c5;
+  font-size: 11px;
+  font-weight: 900;
+  padding: 3px 7px;
+}
+.release-name {
+  display: block;
+  margin-left: 40px;
+  margin-bottom: 10px;
+  color: #7f8aa0;
+  font-size: 11px;
+  line-height: 1.25;
+  overflow-wrap: anywhere;
+}
+.torrent-status-row {
+  display: flex;
+  gap: 7px;
+  flex-wrap: wrap;
+  align-items: center;
+  margin-left: 40px;
+  margin-bottom: 10px;
+}
+.mini-pill {
+  background: #151a24;
+  border: 1px solid #2b303d;
+  border-radius: 999px;
+  color: #b7c0d1;
+  font-size: 11px;
+  font-weight: 850;
+  padding: 4px 8px;
+}
+.metric-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+  margin-left: 40px;
+}
+.metric {
+  background: #0c1119;
+  border: 1px solid #2b303d;
+  border-radius: 11px;
+  padding: 8px;
+  min-width: 0;
+}
+.metric.wide { grid-column: 1 / -1; }
+.metric-label {
+  display: block;
+  color: #778399;
+  font-size: 10px;
+  font-weight: 900;
+  text-transform: uppercase;
+  letter-spacing: .04em;
+  margin-bottom: 3px;
+}
+.metric-value {
+  display: block;
+  color: #dce6f7;
+  font-size: 12px;
+  font-weight: 950;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.status-chip {
+  border-radius: 999px;
+  padding: 4px 9px;
+  font-size: 11px;
+  font-weight: 950;
+  border: 1px solid transparent;
+  text-transform: uppercase;
+  letter-spacing: .02em;
+}
+.status-chip.ready { background: #12351e; color: #85f0a3; border-color: #2dbd6e; }
+.status-chip.imported { background: #1b2b4a; color: #9db3ff; border-color: #375dae; }
+.folder-meta { display: block; color: #aeb6c5; font-size: 13px; }
+label { display: block; margin-top: 14px; margin-bottom: 7px; font-weight: 750; }
+input {
+  width: 100%;
+  padding: 12px;
+  border-radius: 11px;
+  border: 1px solid #3d4351;
+  background: #0f1218;
+  color: white;
+  font-size: 15px;
+}
+.grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+.segmented { display: flex; gap: 10px; }
+.segmented label { flex: 1; margin: 0; cursor: pointer; }
+.segmented input { display: none; }
+.segmented span { display: block; text-align: center; padding: 12px; border: 1px solid #3d4351; border-radius: 11px; background: #0f1218; font-weight: 850; }
+.segmented input:checked + span { border-color: #2dbd6e; background: #15351f; }
+.checkline { display: flex; align-items: center; gap: 10px; color: #cfd6e3; }
+.checkline input { width: auto; }
+.actions { display: flex; gap: 10px; margin-top: 18px; }
+button { padding: 12px 16px; border: 0; border-radius: 11px; background: #2dbd6e; color: white; font-weight: 850; cursor: pointer; }
+button.secondary { background: #1f6feb; }
+.preview-box { min-height: 260px; background: #0b0d12; border: 1px solid #303644; border-radius: 13px; padding: 0; overflow: auto; }
+.empty-preview { padding: 14px; color: #aeb6c5; }
+.preview-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.preview-table th, .preview-table td { text-align: left; vertical-align: top; border-bottom: 1px solid #262b36; padding: 10px; }
+.preview-table th { color: #9db3d9; background: #111620; position: sticky; top: 0; }
+.preview-table td { overflow-wrap: anywhere; }
+.destination { padding: 12px 14px; border-bottom: 1px solid #303644; color: #cfd6e3; }
+.exists { color: #ffcc66; font-weight: 900; }
+.warning { color: #ffcc66; font-weight: 800; }
+.metadata, .imported-box { display: flex; gap: 14px; margin: 18px 0; padding: 14px; border: 1px solid #313644; border-radius: 14px; background: #11141b; }
+.imported-box { display:block; border-color:#ffcc66; }
+.metadata img { width: 92px; border-radius: 8px; object-fit: cover; }
+.metadata h3 { margin: 0 0 6px; }
+.metadata p { margin: 0 0 8px; }
+.hidden { display: none !important; }
+.history { display: grid; gap: 10px; max-height: 72vh; overflow: auto; }
+.history-item { padding: 12px; background: #11141b; border: 1px solid #343a49; border-radius: 12px; }
+.history-item strong, .history-item span, .history-item small { display: block; }
+.history-item span { color: #aeb6c5; font-size: 12px; margin-top: 3px; }
+.history-item small { color: #b8bfcc; margin-top: 5px; overflow-wrap: anywhere; }
+.history-item.bad, .alert.error { border-color: #d85050; }
+.alert { padding: 13px 16px; border-radius: 12px; margin-bottom: 14px; background:#11141b; border:1px solid #343a49; }
+.diag-box { white-space: pre-wrap; background:#0b0d12; border:1px solid #303644; border-radius:13px; padding:15px; overflow:auto; max-height:420px; }
+.good-text { color:#85f0a3; font-weight:800; }
+.bad-text { color:#ff7373; font-weight:800; }
+@media (max-width: 1150px) { .layout { grid-template-columns: 1fr; } }
+
+.history-tabs {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 8px;
+  margin: 12px 0;
+}
+
+.history-tab {
+  padding: 9px 10px;
+  border: 1px solid #343a49;
+  background: #10141d;
+  color: #cfd6e3;
+  border-radius: 12px;
+  font-weight: 900;
+  cursor: pointer;
+}
+
+.history-tab.active {
+  border-color: #2dbd6e;
+  background: #12351e;
+  color: #85f0a3;
+}
+
+.history-item.success {
+  border-color: #2dbd6e;
+}
+
+
+.history-tabs {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 8px;
+  margin: 12px 0;
+}
+
+.history-tab {
+  padding: 9px 10px;
+  border: 1px solid #343a49;
+  background: #10141d;
+  color: #cfd6e3;
+  border-radius: 12px;
+  font-weight: 900;
+  cursor: pointer;
+}
+
+.history-tab.active {
+  border-color: #2dbd6e;
+  background: #12351e;
+  color: #85f0a3;
+}
+
+.history-item.success {
+  border-color: #2dbd6e;
+}
+
+
+button.disabled,
+button:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+
+
+
+===== FILE: app\templates\dev.html =====
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>{{ app_name }} Dev</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<main class="shell narrow">
+  <header class="hero">
+    <div>
+      <h1>Developer Mode</h1>
+      <p>{{ app_name }} {{ version }}</p>
+    </div>
+    <div class="hero-actions">
+      <a class="navlink" href="/">Home</a>
+      <a class="navlink" href="/settings">Settings</a>
+    </div>
+  </header>
+
+  <section class="card">
+    <h2>Log</h2>
+    <pre class="diag-box">{{ log }}</pre>
+  </section>
+</main>
+</body>
+</html>
+
+
+
+===== FILE: app\templates\index.html =====
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{ app_name }} {{ version }}</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <main class="shell">
+    <section class="hero">
+      <div>
+        <h1>{{ app_name }}</h1>
+        <p>Hard-link completed media into Jellyfin-friendly folders while qBittorrent keeps seeding.</p>
+      </div>
+
+      <nav class="hero-actions">
+        <a class="navlink" href="/settings">Settings</a>
+        {% if settings.developer_mode %}
+          <a class="navlink" href="/dev">Dev</a>
+        {% endif %}
+        <span class="badge">{{ version }}</span>
+        <span class="pill {% if tmdb_enabled %}good{% endif %}">
+          {% if tmdb_enabled %}TMDb on{% else %}TMDb off{% endif %}
+        </span>
+        <span class="pill {% if jellyfin_enabled %}good{% endif %}">
+          {% if jellyfin_enabled %}Jellyfin on{% else %}Jellyfin off{% endif %}
+        </span>
+        <span class="pill {% if qbittorrent_enabled %}good{% endif %}">
+          {% if qbittorrent_enabled %}qBit on{% else %}Folder mode{% endif %}
+        </span>
+      </nav>
+    </section>
+
+    {% if queue_error %}
+      <div class="alert error">{{ queue_error }}</div>
+    {% endif %}
+
+    <section class="layout">
+      <aside class="card">
+        <div class="card-head">
+          <div>
+            <h2>{% if qbittorrent_enabled %}Completed Torrents{% else %}Folders{% endif %}</h2>
+            <p class="section-subtitle">
+              {% if qbittorrent_enabled %}
+                Completed video torrents ready to import.
+              {% else %}
+                Download folders ready to scan.
+              {% endif %}
+            </p>
+          </div>
+          <span>{{ items|length }} total</span>
+        </div>
+
+        {% if qbittorrent_enabled %}
+          {% set ready_count = namespace(value=0) %}
+          {% set imported_count = namespace(value=0) %}
+          {% for item in items %}
+            {% if item.imported %}
+              {% set imported_count.value = imported_count.value + 1 %}
+            {% else %}
+              {% set ready_count.value = ready_count.value + 1 %}
+            {% endif %}
+          {% endfor %}
+
+          <div class="queue-tabs" role="tablist" aria-label="Queue filters">
+            <button class="queue-tab active" type="button" data-filter="ready">
+              Ready <span>{{ ready_count.value }}</span>
+            </button>
+            <button class="queue-tab" type="button" data-filter="imported">
+              Imported <span>{{ imported_count.value }}</span>
+            </button>
+            <button class="queue-tab" type="button" data-filter="all">
+              All <span>{{ items|length }}</span>
+            </button>
+          </div>
+        {% endif %}
+
+        <input id="queueSearch" class="search" placeholder="Search queue..." autocomplete="off">
+
+        <div class="folder-list" id="queueList">
+          {% if items %}
+            {% for item in items %}
+              <button
+                class="folder torrent-card {% if item.imported %}imported{% endif %}"
+                type="button"
+                data-source="{{ item.path }}"
+                data-source-key="{{ item.source_key if item.source_key else item.path }}"
+                data-title="{{ item.title }}"
+                data-year="{{ item.year }}"
+                data-season="{{ item.season }}"
+                data-type="{{ item.type }}"
+                data-imported="{% if item.imported %}true{% else %}false{% endif %}"
+              >
+                <span class="torrent-topline">
+                  <span class="torrent-icon">{{ item.icon }}</span>
+                  <span class="torrent-heading">
+                    <span class="folder-title">{{ item.title if item.title else item.name }}</span>
+                    {% if item.year %}
+                      <span class="year-pill">{{ item.year }}</span>
+                    {% endif %}
+                  </span>
+                </span>
+
+                <span class="release-name">{{ item.name }}</span>
+
+                <span class="torrent-status-row">
+                  <span class="status-chip {% if item.imported %}imported{% else %}ready{% endif %}">
+                    {% if item.imported %}Imported{% else %}Ready{% endif %}
+                  </span>
+                  <span class="mini-pill">{{ item.type_label }}</span>
+                  <span class="mini-pill">{{ item.video_count }} video{% if item.video_count != 1 %}s{% endif %}</span>
+                </span>
+
+                {% if qbittorrent_enabled %}
+                  <span class="metric-grid">
+                    <span class="metric">
+                      <span class="metric-label">Ratio</span>
+                      <span class="metric-value">{{ item.ratio }}</span>
+                    </span>
+                    <span class="metric">
+                      <span class="metric-label">State</span>
+                      <span class="metric-value">{{ item.state if item.state else "â€”" }}</span>
+                    </span>
+                    {% if item.category %}
+                      <span class="metric wide">
+                        <span class="metric-label">Category</span>
+                        <span class="metric-value">{{ item.category }}</span>
+                      </span>
+                    {% endif %}
+                  </span>
+                {% else %}
+                  <span class="folder-meta">{{ item.modified }}</span>
+                {% endif %}
+              </button>
+            {% endfor %}
+          {% else %}
+            <p>No completed video items found.</p>
+          {% endif %}
+        </div>
+
+        <div id="queueEmpty" class="queue-empty hidden">
+          No items match this filter.
+        </div>
+      </aside>
+
+      <section class="card">
+        <h2>Import</h2>
+
+        <form method="post" action="/organize">
+          <input type="hidden" id="source" name="source">
+          <input type="hidden" id="sourceKey" name="source_key">
+
+          <label>Media Type</label>
+          <div class="segmented">
+            <label>
+              <input type="radio" name="media_type" value="tv" checked>
+              <span>ðŸ“º TV Show</span>
+            </label>
+            <label>
+              <input type="radio" name="media_type" value="movie">
+              <span>ðŸŽ¬ Movie</span>
+            </label>
+          </div>
+
+          <label for="title">Title</label>
+          <input id="title" name="title" autocomplete="off">
+
+          <div class="grid">
+            <div>
+              <label for="year">Year</label>
+              <input id="year" name="year" placeholder="optional" autocomplete="off">
+            </div>
+        <div>
+            <label for="imdb_id">IMDb ID</label>
+            <input id="imdb_id" name="imdb_id" placeholder="optional, e.g. tt13056008" autocomplete="off">
+        </div>
+            <div id="seasonWrap">
+              <label for="season">Season</label>
+              <input id="season" name="season" value="01" autocomplete="off">
+            </div>
+          </div>
+
+          <label class="checkline">
+            <input type="checkbox" name="refresh_jellyfin">
+            Refresh Jellyfin after link
+          </label>
+
+          <div id="metadata" class="metadata hidden"></div>
+          <div id="importedBox" class="imported-box hidden"></div>
+          <div id="warning" class="warning"></div>
+
+          <div class="actions">
+            <button id="previewBtn" class="secondary" type="button">Preview</button>
+            <button type="submit">Create Hard Links</button>
+            <button id="markImportedBtn" class="secondary" type="button">âœ“ Mark Imported</button>
+            {% if settings.developer_mode %}
+              <button id="unmarkImportedBtn" class="danger hidden" type="button">Unmark Imported</button>
+            {% endif %}
+          </div>
+        </form>
+
+        <h3>Dry Run Preview</h3>
+        <div id="preview" class="preview-box">
+          <div class="empty-preview">Select a queue item to begin.</div>
+        </div>
+
+        {% if settings.developer_mode %}
+          <h3>Link Diagnostics</h3>
+          <pre id="diagnostics" class="diag-box">Preview an item to see path diagnostics.</pre>
+        {% endif %}
+      </section>
+
+      <aside class="card">
+        <h2>Import History</h2>
+        <div class="history-tabs">
+          <button class="history-tab active" type="button" data-history-filter="success">Success</button>
+          <button class="history-tab" type="button" data-history-filter="error">Errors</button>
+          <button class="history-tab" type="button" data-history-filter="all">All</button>
+        </div>
+
+        <div class="history">
+          {% if history %}
+            {% for item in history %}
+              <div class="history-item {% if item.type == 'error' %}bad{% endif %}" data-history-type="{% if item.type == 'error' %}error{% else %}success{% endif %}">
+                <strong>
+                  {% if item.type == 'tv' %}ðŸ“º{% elif item.type == 'movie' %}ðŸŽ¬{% else %}âš ï¸{% endif %}
+                  {{ item.title }}
+                </strong>
+                <span>{{ item.time }}</span>
+                {% if item.type == 'error' %}
+                  <small>{{ item.error }}</small>
+                {% else %}
+                  <small>{{ item.count }} link(s) â†’ {{ item.destination }}</small>
+                {% endif %}
+              </div>
+            {% endfor %}
+          {% else %}
+            <p>No hard links created yet.</p>
+          {% endif %}
+        </div>
+      </aside>
+    </section>
+  </main>
+
+  <script src="/static/app.js"></script>
+  <script>
+    (function () {
+      const tabs = document.querySelectorAll(".queue-tab");
+      const cards = document.querySelectorAll(".torrent-card");
+      const search = document.querySelector("#queueSearch");
+      const empty = document.querySelector("#queueEmpty");
+      let activeFilter = "ready";
+
+      function cardMatchesFilter(card) {
+        const imported = card.dataset.imported === "true";
+        if (activeFilter === "ready") return !imported;
+        if (activeFilter === "imported") return imported;
+        return true;
+      }
+
+      function cardMatchesSearch(card) {
+        if (!search) return true;
+        const term = search.value.trim().toLowerCase();
+        if (!term) return true;
+        return card.textContent.toLowerCase().includes(term);
+      }
+
+      function applyFilters() {
+        let visibleCount = 0;
+
+        cards.forEach(card => {
+          const visible = cardMatchesFilter(card) && cardMatchesSearch(card);
+          card.classList.toggle("hidden", !visible);
+          if (visible) visibleCount += 1;
+        });
+
+        if (empty) empty.classList.toggle("hidden", visibleCount !== 0);
+      }
+
+      tabs.forEach(tab => {
+        tab.addEventListener("click", () => {
+          tabs.forEach(t => t.classList.remove("active"));
+          tab.classList.add("active");
+          activeFilter = tab.dataset.filter || "ready";
+          applyFilters();
+        });
+      });
+
+      if (search) search.addEventListener("input", applyFilters);
+      applyFilters();
+    })();
+  </script>
+
+<script>
+document.addEventListener("DOMContentLoaded", () => {
+  const tabs = document.querySelectorAll(".history-tab");
+  const items = document.querySelectorAll(".history-item");
+
+  function applyHistoryFilter(filter) {
+    items.forEach(item => {
+      const type = item.dataset.historyType || "success";
+      item.classList.toggle("hidden", !(filter === "all" || filter === type));
+    });
+  }
+
+  tabs.forEach(tab => {
+    tab.addEventListener("click", () => {
+      tabs.forEach(t => t.classList.remove("active"));
+      tab.classList.add("active");
+      applyHistoryFilter(tab.dataset.historyFilter || "success");
+    });
+  });
+
+  applyHistoryFilter("success");
+});
+</script>
+\n</body>
+</html>
+
+
+
+
+
+
+===== FILE: app\templates\settings.html =====
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>{{ app_name }} Settings</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<main class="shell narrow">
+  <header class="hero">
+    <div>
+      <h1>Settings</h1>
+      <p>{{ app_name }} {{ version }}</p>
+    </div>
+    <div class="hero-actions">
+      <a class="navlink" href="/">Home</a>
+      <a class="navlink" href="/dev">Dev</a>
+    </div>
+  </header>
+
+  <section class="card">
+    <form method="post" action="/settings" id="settingsForm">
+      <h2>qBittorrent</h2>
+      <label class="checkline"><input type="checkbox" name="qbittorrent_enabled" {% if settings.qbittorrent_enabled %}checked{% endif %}> Enable qBittorrent queue</label>
+
+      <label>qBittorrent URL</label>
+      <input name="qbittorrent_url" id="qbittorrent_url" value="{{ settings.qbittorrent_url }}" placeholder="http://192.168.0.109:8080">
+
+      <label>Username</label>
+      <input name="qbittorrent_username" id="qbittorrent_username" value="{{ settings.qbittorrent_username }}">
+
+      <label>Password</label>
+      <input name="qbittorrent_password" id="qbittorrent_password" type="password" value="{{ settings.qbittorrent_password }}">
+
+      <button type="button" class="secondary" id="testQbit">Test qBittorrent</button>
+      <p id="testResult"></p>
+
+      <h2>TMDb</h2>
+      <label>TMDb API Key</label>
+      <input name="tmdb_api_key" id="tmdb_api_key" value="{{ settings.tmdb_api_key }}" placeholder="Paste your TMDb API key">
+
+      <button type="button" class="secondary" id="testTmdb">Test TMDb</button>
+      <p id="tmdbTestResult"></p>
+
+      <h2>Jellyfin</h2>
+      <label>Jellyfin URL</label>
+      <input name="jellyfin_url" value="{{ settings.jellyfin_url }}" placeholder="http://192.168.0.109:8096">
+
+      <label>Jellyfin API Key</label>
+      <input name="jellyfin_api_key" value="{{ settings.jellyfin_api_key }}">
+
+      <h2>Developer</h2>
+      <label class="checkline"><input type="checkbox" name="developer_mode" {% if settings.developer_mode %}checked{% endif %}> Developer Mode</label>
+
+      <div class="actions">
+        <button type="submit">Save Settings</button>
+      </div>
+    </form>
+  </section>
+</main>
+<script src="/static/settings.js"></script>
+</body>
+</html>
+
+
+
+===== FILE: app\__pycache__\config.cpython-312.pyc =====
+Ë
+    Bj  ã                   óJ  — d dl Z d dlmZ dZdZ ee j
+                  j                  dd«      «      Z ee j
+                  j                  dd«      «      Z ee j
+                  j                  d	d
+«      «      Z	 ee j
+                  j                  dd«      «      Z
+e j
+                  j                  dd«      Ze j
+                  j                  dd«      Z ee j
+                  j                  dd«      «      Zh d£Zh d£Zg d¢Ze
+j#                  dd¬«       e
+dz  Ze
+dz  Ze
+dz  Ze
+dz  Zy)é    N)ÚPathzNASDY Media Linkerzv3.4.0ÚDOWNLOADS_ROOTz
+/downloadsÚMOVIES_ROOTz/media/MoviesÚTV_ROOTz/media/TV ShowsÚ	DATA_ROOTz/dataÚHOST_DOWNLOADS_ROOTz/mnt/user/NASDY/downloadsÚHOST_MEDIA_ROOTz/mnt/user/NASDY/mediaÚHOST_MNT_ROOTz	/host_mnt>   ú.aviú.m4vú.mkvú.movú.mp4ú.wmv>
+   útv showsú
+lost+foundúmedia linkerúmedia organizerÚtvÚbooksÚmusicÚprintÚmoviesÚ
+audiobooks)<Ú2160pÚ1080pÚ720pÚ480pÚwebripzweb-ripzweb-dlÚwebdlÚblurayzblu-rayÚbrripÚhdripÚdvdripÚuhdÚtruehdÚremuxÚx264Úx265Úh264Úh265ÚhevcÚav1ÚflacÚaacr&   ÚatmosÚdtszdts-hdÚmaÚhdrÚhdr10ÚdvÚdolbyÚvisionÚproperÚrepackÚextendedÚunratedÚ	directorsÚdirectorÚcutÚamznÚamazonÚnfÚnetflixÚhuluÚmaxÚlamaÚtrolluhdÚplaywebÚddpÚdd5z5.1z7.1Ú10bitÚ8bitÚytsÚrarbgÚeac3ÚsiqmaT)ÚparentsÚexist_okzhistory.jsonlzimports.jsonzsettings.jsonzmedia-linker.log)ÚosÚpathlibr   ÚAPP_NAMEÚAPP_VERSIONÚenvironÚgetr   r   r   r   r   r	   r
+   ÚVIDEO_EXTENSIONSÚIGNORE_NAMESÚQUALITY_WORDSÚmkdirÚHISTORY_FILEÚIMPORT_DB_FILEÚSETTINGS_FILEÚLOG_FILE© ó    úapp\config.pyÚ<module>rc      s  ðÛ 	Ý à€Ø€áb—j‘j—n‘nÐ%5°|ÓDÓE€Ù2—:‘:—>‘> -°ÓAÓB€Ù
+ˆrz‰z~‰~˜iÐ):Ó;Ó
+<€Ù—‘—‘ ¨WÓ5Ó6€	à—j‘j—n‘nÐ%:Ð<WÓXÐ Ø—*‘*—.‘.Ð!2Ð4KÓL€ÙR—Z‘Z—^‘^ O°[ÓAÓB€âCÐ ò€ò
+€ð 
+‡˜ t€Ô ,à˜?Ñ*€Ø˜^Ñ+€Ø˜OÑ+€ØÐ)Ñ)ra   
+
+
+===== FILE: app\__pycache__\main.cpython-312.pyc =====
+Ë
+    ÀïBjo   ã                   ól  — d dl m Z  d dlmZ d dlmZ d dlmZmZmZ d dl	m
+Z
+mZmZ d dlmZ d dlmZ d dlmZmZ d d	lmZmZmZmZmZmZ d d
+lmZ d dlmZmZm Z  d dl!m"Z" d dl#m$Z$ d dl%m&Z& d dl%m'Z' d dl(m)Z) d dl*m+Z+m,Z,  ee¬«      Z-e-j]                  d ed¬«      d¬«        ed¬«      Z/d„ Z0d„ Z1e-je                  de
+¬«      defd„«       Z3e-je                  de
+¬«      defd „«       Z4e-jk                  d«       ed!«       ed"«       ed"«       ed"«       ed"«       ed"«       ed"«       ed!«      fd#ee6   d$e6d%e6d&e6d'e6d(e6d)e6d*ee6   fd+„«       Z7e-jk                  d,«      defd-„«       Z8e-jk                  d.«      defd/„«       Z9e-jk                  d0«       ed1«       ed1«       ed"«       ed1«       ed"«       ed"«       ed2«       ed!«      fd3e6d4e6d5e6d6e6d7e6d8e6d9e6d:ee6   fd;„«       Z:e-je                  d<e
+¬«      defd=„«       Z;e-jk                  d>«      d?„ «       Z<e-je                  d@«      dA„ «       Z=y!)Bé    )Údatetime)ÚPath)ÚOptional)ÚFastAPIÚRequestÚForm)ÚHTMLResponseÚRedirectResponseÚJSONResponse)ÚStaticFiles)ÚJinja2Templates©ÚAPP_NAMEÚAPP_VERSION)Úload_settingsÚsave_settingsÚload_import_dbÚsave_import_dbÚappend_historyÚread_history)Úqueue_items)Ú
+build_planÚcreate_hard_linksÚdiagnostic_for_link)Útmdb_search)Újellyfin_refresh)Únormalize_source_path)Ú	test_qbit)Úfind_library_match)Úread_logÚlog)Útitlez/staticz
+app/static)Ú	directoryÚstatic)Únamezapp/templatesc                 óf   — t        d„ | D «       «      }t        d„ | D «       «      }|}d|id|id|idœS )Nc              3   óJ   K  — | ]  }|j                  d «      dk(  sŒd–— Œ y­w)ÚstatusÚsuccessé   N©Úget©Ú.0Úhs     úapp\main.pyÚ	<genexpr>z!history_counts.<locals>.<genexpr>   s    è ø€ ÐE™W˜¨¯©¨h«¸9Ó(D”!™Wùs   ‚#œ#c              3   ór   K  — | ]/  }|j                  d «      dk(  s|j                  d«      dk(  sŒ,d–— Œ1 y­w)r(   ÚerrorÚtyper*   Nr+   r-   s     r0   r1   z!history_counts.<locals>.<genexpr>   s0   è ø€ Ð]™7a a§e¡e¨H£o¸Ò&@ÀAÇEÁEÈ&ÃMÐU\ÓD\”™7ùs   ‚-7°7Úvalue)Úsuccess_countÚerror_countÚimported_count)Úsum)Úhistoryr)   r3   Úimporteds       r0   Úhistory_countsr<      sI   € ÜÑE™WÓEÓE€GÜÑ]™7Ó]Ó]€EØ€Hà! 7Ð+Ø Ð'Ø" HÐ-ñð ó    c                 óÀ   — |xs d|xs dt        |xs d«      |rt        t        |«      «      ndh}|D ]'  }t        |xs d«      j                  «       }|sŒ#|| |<   Œ) | S )NÚ )r   Ústrr   Ústrip)ÚdbÚ
+source_keyÚsourceÚentryÚkeysÚkeys         r0   Úsave_import_aliasesrH   %   si   € àÒbØŠ"Ü˜fšl¨Ó+Ù#ŒŒD‹LÔ¨ð	€Dó ˆÜ#’)˜‹n×"Ñ"Ó$ˆÚØˆBˆsŠGð ð
+ €Ir=   Ú/)Úresponse_classÚrequestc                 ól  — t        «       }t        |«      \  }}}t        «       }t        |«      }t        j                  d| t        t        |||||t        |j                  d«      «      t        |j                  d«      xr |j                  d«      «      t        |j                  d«      «      dœ|¥«      S )Nz
+index.htmlÚtmdb_api_keyÚjellyfin_urlÚjellyfin_api_keyÚqbittorrent_enabled)rK   Úapp_nameÚversionÚitemsÚsource_labelÚqueue_errorr:   ÚsettingsÚtmdb_enabledÚjellyfin_enabledrP   )
+r   r   r   r<   Ú	templatesÚTemplateResponser   r   Úboolr,   )rK   rV   rS   rT   rU   r:   Úcountss          r0   Úindexr]   5   sª   € ä‹€HÜ'2°8Ó'<Ñ$€Eˆ<˜Ü‹n€GÜ˜GÓ$€Fä×%Ñ% lØÜÜØØ$Ø"ØØÜ˜XŸ\™\¨.Ó9Ó:Ü  §¡¨nÓ!=Ò!bÀ(Ç,Á,ÐOaÓBbÓcÜ# H§L¡LÐ1FÓ$GÓHñ5ð ð5ó ð r=   z	/settingsc                 óX   — t         j                  d| t        t        t	        «       dœ«      S )Nzsettings.html)rK   rQ   rR   rV   )rY   rZ   r   r   r   )rK   s    r0   Úsettings_pager_   L   s*   € ä×%Ñ% oØÜÜÜ!“Oñ	8ó ð r=   Nr?   rP   Úqbittorrent_urlÚqbittorrent_usernameÚqbittorrent_passwordrM   rN   rO   Údeveloper_modec                 ó0  — t        t        | «      |j                  «       j                  d«      |j                  «       ||j                  «       |j                  «       j                  d«      |j                  «       t        |«      dœ«       t	        dd¬«      S )NrI   ©rP   r`   ra   rb   rM   rN   rO   rc   z/settings?saved=1é/  ©Ústatus_code)r   r[   rA   Úrstripr
+   re   s           r0   Úsave_settings_routerj   V   s‡   € ô Ü#Ð$7Ó8Ø*×0Ñ0Ó2×9Ñ9¸#Ó>Ø 4× :Ñ :Ó <Ø 4Ø$×*Ñ*Ó,Ø$×*Ñ*Ó,×3Ñ3°CÓ8Ø,×2Ñ2Ó4Ü˜~Ó.ñ	ô 	ô Ð/¸SÔAÐAr=   z/api/qbit/testc              ƒ   ó
+  K  — | j                  «       ƒ d {  –—† }t        «       }|j                  |«       	 t        |«      }t	        dd|› ddœ«      S 7 Œ=# t
+        $ r!}t	        dt        |«      dœ«      cY d }~S d }~ww xY w­w)NTzConnected. z completed torrent(s) found.©ÚokÚmessageF)Újsonr   Úupdater   r   Ú	Exceptionr@   )rK   ÚdatarV   Ú	completedÚes        r0   Úapi_qbit_testru   n   sz   è ø€ à—‘“×€DÜ‹€HØ‡OODÔð>Ü˜hÓ'ˆ	Ü 4°kÀ)ÀÐLhÐ4iÑjÓkÐkð  ùô ò >Ü 5´S¸³VÑ<Ó=Õ=ûð>üs>   ‚B–A—B·A ÁBÁ	B ÁA;Á5B Á6BÁ;B Â Bz/api/previewc              ƒ   ó4  K  — | j                  «       ƒ d {  –—† }	 |j                  dd«      }|j                  dd«      }|j                  dd«      }|j                  dd«      }|j                  dd«      j                  «       }|j                  dd	«      }t        |||||«      \  }}	t	        «       }
+t        |
+|||«      xs i }t        ||||«      }t        «       }|j                  d
+«      xs |xs d}||t        |«      |rt        t        |«      «      ndh}d }|D ]  }|sŒ||v sŒ|j                  |«      } n g }|	D ]5  }|j                  t        t        |d   «      t        |d   «      «      «       Œ7 t        dt        |«      i |¥d|i¥||||	D cg c]>  }t        |d   «      t        |d   «      |d   t        |d   «      j                  «       dœ‘Œ@ c}dœ«      S 7 ŒÍc c}w # t        $ r!}t        dt        |«      dœ«      cY d }~S d }~ww xY w­w)NÚ
+media_typeÚtvrD   r?   r"   ÚyearÚimdb_idÚseasonÚ01rC   ÚsrcÚdstTÚnew_name)r}   r~   r   Úexists)rm   ÚdestinationÚmetadataÚlibrary_matchr;   ÚdiagnosticsrS   F)rm   r3   )ro   r,   rA   r   r   r   r   r   r   r@   r   Úappendr   r   r€   rq   )rK   rr   rw   rD   r"   ry   rz   r{   Údest_dirrS   rV   Úmetarƒ   rB   rC   Úimport_candidatesr;   rG   r„   Úirt   s                        r0   Úapi_previewrŠ   z   s0  è ø€ à—‘“×€Dð2<Ø—X‘X˜l¨DÓ1ˆ
+Ø—‘˜( BÓ'ˆØ—‘˜ "Ó%ˆØx‰x˜ Ó#ˆØ—(‘(˜9 bÓ)×/Ñ/Ó1ˆØ—‘˜( DÓ)ˆä$ Z°¸ÀÀfÓM‰ˆ%Ü “?ˆä˜8 Z°¸Ó=ÒCÀˆÜ*¨:°u¸dÀFÓKˆäÓˆØ—X‘X˜lÓ+Ò;¨vÒ;¸ˆ
+àØÜ! &Ó)Ù!'ŒC”V“Ô¨Rð	
+Ðð ˆÛ$ˆCÚs˜b’yØŸ6™6 #›;Ùð %ð
+ ˆÛˆAØ×ÑÔ2´4¸¸%¹³>Ä4ÈÈ%ÉÃ>ÓRÕSð ô ØÜ˜x›=ðØðà˜7ñð +Ø Ø&ñ óñ
+ !ô	 ˜1˜U™8“}Ü˜1˜U™8“}Ø˜j™MÜ˜q ™x›.×/Ñ/Ó1ó	ð
+ ññ
+ó ð 	ðC  ûòVøô ò <Ü 5´3°q³6Ñ:Ó;Õ;ûð<üs_   ‚H–G#—HœDG+ Ä$G+ Ä)A.G+ ÆAG&ÇG+ Ç"HÇ&G+ Ç+	HÇ4HÈ
+HÈHÈHÈHz	/organize.r|   rw   rD   rC   r"   ry   rz   r{   Úrefresh_jellyfinc                 ó~  — 	 t        «       }t        | ||||«      \  }	}
+t        |
+«      \  }}d}|rt        |«      \  }}t	        j
+                  «       j                  d«      | |||j                  «       | dk(  r|ndt        |«      t        |	«      |d|||dœ}t        |«       t        «       }t        ||||«      }t        |«       t        dd¬«      S # t        $ rb}t!        d	|› «       t        t	        j
+                  «       j                  d«      d
+|t        |«      d
+||dœ«       t        dd¬«      cY d }~S d }~ww xY w)Nr?   z%Y-%m-%d %H:%Mrx   r)   )Útimer4   r"   ry   rz   r{   Úcountr   Újellyfinr(   rD   rC   r„   rI   rf   rg   zERROR organize: r3   )r   r4   r"   r3   r(   rD   rC   )r   r   r   r   r   ÚnowÚstrftimerA   Úlenr@   r   r   rH   r   r
+   rq   r!   )rw   rD   rC   r"   ry   rz   r{   r‹   rV   r†   rS   Úcreatedr„   Újf_msgÚ_rE   rB   rt   s                     r0   Úorganizer–   ²   s@  € ð+6Ü “?ˆÜ$ Z°¸ÀÀfÓM‰ˆ%Ü0°Ó7ÑˆàˆÙÜ(¨Ó2‰IˆAˆvô —L‘L“N×+Ñ+Ð,<Ó=ØØØØ—}‘}“Ø *¨dÒ 2‘f¸Ü˜“\Ü˜x›=ØØØØ$Ø&ñ
+ˆô  	uÔäÓˆÜ   Z°¸Ó?ˆÜrÔä °Ô5Ð5øÜò 6ÜÐ˜q˜cÐ"Ô#ÜÜ—L‘L“N×+Ñ+Ð,<Ó=ØØÜ˜“VØØØ$ñ
+ô 	ô   °Ô5Õ5ûð6ús   ‚CC Ã	D<ÃAD7Ä1D<Ä7D<z/devc           	      ón   — t        «       }t        j                  d| t        t        |t        «       dœ«      S )Nzdev.html)rK   rQ   rR   rV   r!   )r   rY   rZ   r   r   r    )rK   rV   s     r0   Údev_pager˜   ë   s4   € ä‹€HÜ×%Ñ% jØÜÜØÜ‹zñ3ó ð r=   z/api/jellyfin/refreshc                  óJ   — t        t        «       «      \  } }t        | |dœ«      S )Nrl   )r   r   r   )rm   Úmsgs     r0   Úapi_jellyfin_refreshr›   ÷   s"   € äœ}›Ó/G€BˆÜ˜r¨cÑ2Ó3Ð3r=   z/healthc                  ó   — dt         t        dœS )NT)rm   r%   rR   r   © r=   r0   Úhealthrž   ý   s   € ð ÜÜñð r=   )>r   Úpathlibr   Útypingr   Úfastapir   r   r   Úfastapi.responsesr	   r
+   r   Úfastapi.staticfilesr   Úfastapi.templatingr   Ú
+app.configr   r   Úapp.services.storager   r   r   r   r   r   Úapp.services.queuer   Úapp.services.linkerr   r   r   Úapp.services.tmdbr   Úapp.services.jellyfinr   Úapp.services.qbittorrentr   r   Úapp.services.libraryr   Úapp.services.loggerr    r!   ÚappÚmountrY   r<   rH   r,   r]   r_   Úpostr@   rj   ru   rŠ   r–   r˜   r›   rž   r   r=   r0   Ú<module>r±      sÏ  ðÝ Ý Ý ç *Ñ *ß JÑ JÝ +Ý .ç ,ß {× {Ý *ß RÑ RÝ )Ý 2Ý :Ý .Ý 3ß -áHÔ€Ø ‡		ˆ)‘[¨<Ô8¸x€	Ô HÙ oÔ6€	òòð  ‡ˆ˜\€Ó*ð7ò ó +ðð, ‡ˆ \€Ó2ð˜7ò ó 3ðð ‡ˆ+Óá)-¨d«Ù ›8Ù $ R£Ù $ R£Ù˜R›Ù˜R›Ù  ›HÙ$(¨£JñBØ! #™ðBàðBð ðBð ð	Bð
+ ðBð ðBð ðBð ˜S‘MòBó ðBð. ‡Ð
+Óð> ò >ó ð>ð ‡ˆ.Óð4<˜wò 4<ó ð4<ðn ‡ˆ+Óá˜3“iÙs“)Ù˜2“hÙc“ÙR“Ù˜“8Ùt“*Ù&*¨4£jñ56Øð56àð56ð ð56ð ð	56ð
+ ð56ð ð56ð ð56ð ˜s‘mò56ó ð56ðp ‡ˆ €Ó-ðgò ó .ðð ‡Ð
+!Ó"ñ4ó #ð4ð
+ ‡ˆÓñó ñr=   
+
+
+===== FILE: Dockerfile =====
+FROM python:3.12-slim
+
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY app ./app
+
+ENV PORT=8088
+EXPOSE 8088
+
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8088"]
+
+
+
+===== FILE: requirements.txt =====
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+jinja2==3.1.4
+python-multipart==0.0.20
+requests==2.32.3
+
+
+

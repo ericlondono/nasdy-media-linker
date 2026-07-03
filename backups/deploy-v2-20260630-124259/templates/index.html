@@ -1,0 +1,123 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>{{ app_name }} {{ version }}</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<main class="shell">
+  <header class="hero">
+    <div>
+      <h1>{{ app_name }}</h1>
+      <p>Hard-link completed media into Jellyfin-friendly folders while qBittorrent keeps seeding.</p>
+    </div>
+    <div class="hero-actions">
+      <span class="badge">{{ version }}</span>
+      {% if tmdb_enabled %}<span class="pill good">TMDb on</span>{% else %}<span class="pill">TMDb off</span>{% endif %}
+      {% if jellyfin_enabled %}<span class="pill good">Jellyfin on</span>{% else %}<span class="pill">Jellyfin off</span>{% endif %}
+      {% if qbittorrent_enabled %}<span class="pill good">qBit on</span>{% else %}<span class="pill">Folder mode</span>{% endif %}
+    </div>
+  </header>
+
+  <section class="layout">
+    <aside class="card">
+      <div class="card-head">
+        <h2>{{ source_label }}</h2>
+        <span>{{ items|length }} ready</span>
+      </div>
+      <input class="search" id="queueSearch" placeholder="Search queue...">
+      {% if items %}
+      <div class="folder-list" id="queueList">
+        {% for item in items %}
+        <button class="folder {% if item.imported %}imported{% endif %}"
+          data-source="{{ item.path }}"
+          data-source-key="{{ item.source_key }}"
+          data-title="{{ item.title }}"
+          data-year="{{ item.year }}"
+          data-season="{{ item.season }}"
+          data-type="{{ item.type }}">
+          <span class="folder-title">{{ item.icon }} {{ item.name }}</span>
+          <span class="folder-meta">
+            {{ item.type_label }} · {{ item.video_count }} video(s) · {{ item.modified }}
+            {% if item.imported %} · already linked{% endif %}
+          </span>
+        </button>
+        {% endfor %}
+      </div>
+      {% else %}
+      <p>No completed video items found.</p>
+      {% endif %}
+    </aside>
+
+    <section class="card">
+      <h2>Link & Rename</h2>
+      <form method="post" action="/organize" id="organizeForm">
+        <input type="hidden" name="source" id="source">
+        <input type="hidden" name="source_key" id="sourceKey">
+
+        <label>Media Type</label>
+        <div class="segmented">
+          <label><input type="radio" name="media_type" value="tv" checked> <span>📺 TV Show</span></label>
+          <label><input type="radio" name="media_type" value="movie"> <span>🎬 Movie</span></label>
+        </div>
+
+        <label for="title">Title</label>
+        <input name="title" id="title" required>
+
+        <div class="grid">
+          <div>
+            <label for="year">Year</label>
+            <input name="year" id="year" placeholder="optional">
+          </div>
+          <div id="seasonWrap">
+            <label for="season">Season</label>
+            <input name="season" id="season" value="01">
+          </div>
+        </div>
+
+        <label class="checkline">
+          <input type="checkbox" name="refresh_jellyfin" value="1" {% if not jellyfin_enabled %}disabled{% endif %}>
+          Refresh Jellyfin after link
+        </label>
+
+        <div class="actions">
+          <button type="button" id="previewBtn" class="secondary">Preview</button>
+          <button type="submit">Create Hard Links</button>
+        </div>
+      </form>
+
+      <div id="metadata" class="metadata hidden"></div>
+      <div id="importedBox" class="imported-box hidden"></div>
+
+      <h3>Dry Run Preview</h3>
+      <p id="warning" class="warning"></p>
+      <div id="preview" class="preview-box">Select a queue item to begin.</div>
+    </section>
+
+    <aside class="card history-card">
+      <h2>Recent Links</h2>
+      {% if history %}
+      <div class="history">
+        {% for item in history %}
+        <div class="history-item {% if item.status == 'error' or item.type == 'error' %}bad{% endif %}">
+          <strong>{% if item.type == 'tv' %}📺{% elif item.type == 'movie' %}🎬{% else %}⚠️{% endif %} {{ item.title }}</strong>
+          <span>{{ item.time }}</span>
+          {% if item.type == 'error' %}
+          <small>{{ item.error }}</small>
+          {% else %}
+          <small>{{ item.count }} link(s) → {{ item.destination }}</small>
+          {% endif %}
+        </div>
+        {% endfor %}
+      </div>
+      {% else %}
+      <p>No hard links created yet.</p>
+      {% endif %}
+    </aside>
+  </section>
+</main>
+<script src="/static/app.js"></script>
+</body>
+</html>
