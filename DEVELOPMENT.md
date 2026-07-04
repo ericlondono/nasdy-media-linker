@@ -1,4 +1,4 @@
-# NASDY Media Linker Development Notes
+﻿# NASDY Media Linker Development Notes
 
 ## Current Stable Versions
 
@@ -11,7 +11,7 @@ Development guide: v3.6.3.1
 ## Current Release Target
 
 ```text
-Current app stable:          v3.6.2.2
+Current app stable:          v3.6.3.0
 Next app test candidate:      v3.6.3.0
 Current deploy stable:       Deploy v3.0.1
 Next app release target:     v3.6.3.0 Hardlink Reconciliation
@@ -676,3 +676,4 @@ For longer coding/debugging sessions:
 
 - Start a new Git branch.
 - Start a new ChatGPT conversation when the current one gets too long.
+
