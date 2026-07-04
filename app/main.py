@@ -13,7 +13,7 @@ from app.services.storage import load_settings, save_settings, load_import_db, s
 from app.services.queue import queue_items
 from app.services.linker import build_plan, create_hard_links, diagnostic_for_link
 from app.services.tmdb import tmdb_search, test_tmdb
-from app.services.jellyfin import jellyfin_refresh
+from app.services.jellyfin import jellyfin_refresh, test_jellyfin, normalize_jellyfin_url
 from app.services.qbittorrent import normalize_source_path
 from app.services.qbittorrent import test_qbit
 from app.services.library import find_library_match
@@ -219,7 +219,7 @@ def index(request: Request):
         "history": history,
         "settings": settings,
         "tmdb_enabled": bool(settings.get("tmdb_api_key")),
-        "jellyfin_enabled": bool(settings.get("jellyfin_url") and settings.get("jellyfin_api_key")),
+        "jellyfin_enabled": bool(normalize_jellyfin_url(settings.get("jellyfin_url", "")) and settings.get("jellyfin_api_key")),
         "qbittorrent_enabled": bool(settings.get("qbittorrent_enabled")),
         **counts,
     })
@@ -227,11 +227,13 @@ def index(request: Request):
 
 @app.get("/settings", response_class=HTMLResponse)
 def settings_page(request: Request):
+    settings = load_settings()
+    settings["jellyfin_url"] = normalize_jellyfin_url(settings.get("jellyfin_url", ""))
     return templates.TemplateResponse("settings.html", {
         "request": request,
         "app_name": APP_NAME,
         "version": APP_VERSION,
-        "settings": load_settings(),
+        "settings": settings,
     })
 
 
@@ -252,7 +254,7 @@ def save_settings_route(
         "qbittorrent_username": qbittorrent_username.strip(),
         "qbittorrent_password": qbittorrent_password,
         "tmdb_api_key": tmdb_api_key.strip(),
-        "jellyfin_url": jellyfin_url.strip().rstrip("/"),
+        "jellyfin_url": normalize_jellyfin_url(jellyfin_url),
         "jellyfin_api_key": jellyfin_api_key.strip(),
         "developer_mode": bool(developer_mode),
     })
@@ -281,6 +283,15 @@ async def api_tmdb_test(request: Request):
         return JSONResponse({"ok": True, "message": "TMDb connection successful."})
     except Exception as e:
         return JSONResponse({"ok": False, "message": str(e)})
+
+
+@app.post("/api/jellyfin/test")
+async def api_jellyfin_test(request: Request):
+    data = await request.json()
+    settings = load_settings()
+    settings.update(data)
+    ok, msg = test_jellyfin(settings)
+    return JSONResponse({"ok": ok, "message": msg})
 
 
 @app.post("/api/preview")
@@ -756,8 +767,15 @@ def dev_page(request: Request):
 
 
 @app.post("/api/jellyfin/refresh")
-def api_jellyfin_refresh():
-    ok, msg = jellyfin_refresh(load_settings())
+async def api_jellyfin_refresh(request: Request):
+    settings = load_settings()
+    try:
+        data = await request.json()
+        if isinstance(data, dict):
+            settings.update(data)
+    except Exception:
+        pass
+    ok, msg = jellyfin_refresh(settings)
     return JSONResponse({"ok": ok, "message": msg})
 
 

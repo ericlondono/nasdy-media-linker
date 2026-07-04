@@ -267,7 +267,9 @@ button.secondary { background: #1f6feb; }
 .diag-box { white-space: pre-wrap; background:#0b0d12; border:1px solid #303644; border-radius:13px; padding:15px; overflow:auto; max-height:420px; }
 .good-text { color:#85f0a3; font-weight:800; }
 .bad-text { color:#ff7373; font-weight:800; }
-@media (max-width: 1150px) { .layout { grid-template-columns: 1fr; } }
+.field-help { margin: -6px 0 12px; color: #9aa6b8; font-size: 13px; }
+.inline-actions { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 12px; }
+.inline-actions button { margin-top: 0; }@media (max-width: 1150px) { .layout { grid-template-columns: 1fr; } }
 
 .history-tabs {
   display: grid;

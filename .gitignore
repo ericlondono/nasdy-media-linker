@@ -33,3 +33,5 @@ Desktop.ini
 .mypy_cache/
 .coverage
 htmlcov/
+backups/
+upgrade-v*.ps1

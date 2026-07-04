@@ -224,7 +224,7 @@
           <div id="multiImportManager" class="multi-import-manager hidden"></div>
 
           <label class="checkline">
-            <input type="checkbox" name="refresh_jellyfin">
+            <input type="checkbox" name="refresh_jellyfin" {% if jellyfin_enabled %}checked{% endif %}>
             Refresh Jellyfin after link
           </label>
 
@@ -285,6 +285,9 @@
                     {% if item.skipped %}, {{ item.skipped }} skipped{% endif %}
                     -> {{ item.destination }}
                   </small>
+                  {% if item.jellyfin %}
+                    <small>Jellyfin: {{ item.jellyfin }}</small>
+                  {% endif %}
                 {% endif %}
               </div>
             {% endfor %}

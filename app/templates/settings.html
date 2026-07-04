@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <title>{{ app_name }} Settings</title>
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <link rel="stylesheet" href="/static/style.css">
+  <link rel="stylesheet" href="/static/style.css?v={{ version }}">
 </head>
 <body>
 <main class="shell narrow">
@@ -45,10 +45,17 @@
 
       <h2>Jellyfin</h2>
       <label>Jellyfin URL</label>
-      <input name="jellyfin_url" value="{{ settings.jellyfin_url }}" placeholder="http://192.168.0.109:8096">
+      <input name="jellyfin_url" id="jellyfin_url" value="{{ settings.jellyfin_url }}" placeholder="http://192.168.0.109:8096">
+      <p class="field-help">Use the server URL only. Browser paths like /web/index.html are stripped automatically.</p>
 
       <label>Jellyfin API Key</label>
-      <input name="jellyfin_api_key" value="{{ settings.jellyfin_api_key }}">
+      <input name="jellyfin_api_key" id="jellyfin_api_key" value="{{ settings.jellyfin_api_key }}">
+
+      <div class="inline-actions">
+        <button type="button" class="secondary" id="testJellyfin">Test Jellyfin</button>
+        <button type="button" class="secondary" id="refreshJellyfinNow">Refresh Jellyfin Now</button>
+      </div>
+      <p id="jellyfinTestResult"></p>
 
       <h2>Developer</h2>
       <label class="checkline"><input type="checkbox" name="developer_mode" {% if settings.developer_mode %}checked{% endif %}> Developer Mode</label>
@@ -59,6 +66,6 @@
     </form>
   </section>
 </main>
-<script src="/static/settings.js"></script>
+<script src="/static/settings.js?v={{ version }}"></script>
 </body>
 </html>

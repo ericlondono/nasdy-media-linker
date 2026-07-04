@@ -1,20 +1,20 @@
-﻿# NASDY Media Linker Development Notes
+# NASDY Media Linker Development Notes
 
 ## Current Stable Versions
 
 ```text
-App version:       v3.6.3.0
+App version:       v3.6.4.0
 Deploy version:    Deploy v3.0.1
-Development guide: v3.6.3.1
+Development guide: v3.6.4.0
 ```
 
 ## Current Release Target
 
 ```text
-Current app stable:          v3.6.3.0
-Next app test candidate:      v3.6.3.0
+Current app stable:          v3.6.4.0
+Next app test candidate:      v3.6.4.0
 Current deploy stable:       Deploy v3.0.1
-Next app release target:     v3.6.3.0 Hardlink Reconciliation
+Next app release target:     v3.6.4.0 Jellyfin Refresh Reliability
 Next infrastructure target:  None unless a deploy bug is found
 ```
 
@@ -644,6 +644,30 @@ Expected behavior:
 - Manual re-marking should no longer be needed for media that is still truly hard-linked.
 - New upgraded files are not hidden unless they are the exact same hard-linked file already present in `/media`.
 
+### v3.6.4.0 Jellyfin Refresh Reliability
+
+Problem:
+
+- Jellyfin URL and API key were saved in Settings, but there was no Jellyfin connection test.
+- The refresh checkbox called Jellyfin silently, so refresh failures were easy to miss.
+- A malformed URL such as `http://http://192.168.0.109:8096` could prevent refresh from working.
+- Import History did not display Jellyfin refresh results.
+
+Changes:
+
+- Added Jellyfin URL normalization for duplicate protocols, missing protocol, trailing slashes, and pasted `/web/index.html` browser URLs.
+- Added `Test Jellyfin` in Settings.
+- Added `Refresh Jellyfin Now` in Settings.
+- Kept the post-import Jellyfin refresh behavior, but made it log clearer success/failure messages.
+- Import History now shows the Jellyfin refresh result for each import.
+- `Refresh Jellyfin after link` is checked by default when Jellyfin is configured.
+
+Expected behavior:
+
+- Settings should show the normalized Jellyfin server URL.
+- `Test Jellyfin` should confirm whether the URL/API key can reach Jellyfin.
+- `Refresh Jellyfin Now` should request the same scan that NML requests after import.
+- After an import, Import History should show whether Jellyfin accepted the scan request.
 ## Infrastructure Release Notes
 
 ### Deploy v3.0.1 Cleanup Release

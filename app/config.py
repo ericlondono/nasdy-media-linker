@@ -2,7 +2,7 @@ import os
 from pathlib import Path
 
 APP_NAME = "NASDY Media Linker"
-APP_VERSION = "v3.6.3.0"
+APP_VERSION = "v3.6.4.0"
 
 DOWNLOADS_ROOT = Path(os.environ.get("DOWNLOADS_ROOT", "/downloads"))
 MOVIES_ROOT = Path(os.environ.get("MOVIES_ROOT", "/media/movies"))
