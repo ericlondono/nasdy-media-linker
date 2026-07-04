@@ -3,7 +3,7 @@
 ## Current Stable Versions
 
 ```text
-App version:       v3.6.3.0
+App version:       v3.6.2.2
 Deploy version:    Deploy v3.0.1
 Development guide: v3.6.3.1
 ```
@@ -12,9 +12,8 @@ Development guide: v3.6.3.1
 
 ```text
 Current app stable:          v3.6.2.2
-Next app test candidate:      v3.6.3.0
 Current deploy stable:       Deploy v3.0.1
-Next app release target:     v3.6.3.0 Hardlink Reconciliation
+Next app release target:     TBD
 Next infrastructure target:  None unless a deploy bug is found
 ```
 
@@ -621,28 +620,6 @@ Expected state examples:
 - `queuedUP`
 - `completed`
 - `manual scan` only when no qBittorrent torrent matches.
-
-### v3.6.3.0 Hardlink Reconciliation
-
-Problem:
-
-- Queue items could reappear as not imported after deploys or source-key changes.
-- Existing protection depended mostly on `imports.json` aliases and history records.
-- If tracking aliases were missing or changed, the user had to manually mark already-imported seeding media again.
-
-Changes:
-
-- Added inode/device based hardlink reconciliation.
-- NML now scans source video files in `/downloads` and looks for matching hard links under the media library.
-- If every source video already has a matching hard link in `/media`, the queue row is automatically marked Imported.
-- This comparison uses actual file identity, not title-only matching, so a different release, better resolution, or better audio remains visible for review as a duplicate/upgrade candidate.
-- Preview now reports `Already Hard Linked in Library` for auto-reconciled items.
-
-Expected behavior:
-
-- Previously hard-linked torrents remain in the Imported tab after future deploys.
-- Manual re-marking should no longer be needed for media that is still truly hard-linked.
-- New upgraded files are not hidden unless they are the exact same hard-linked file already present in `/media`.
 
 ## Infrastructure Release Notes
 

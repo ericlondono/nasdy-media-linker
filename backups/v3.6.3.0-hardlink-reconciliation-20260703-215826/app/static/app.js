@@ -653,15 +653,8 @@ function renderImportAdvisor(data) {
 
   if (data.imported) {
     const importType = data.imported.import_type || "linked";
-    const isManualImport = importType === "manual";
-    const isReconciledHardlink = importType === "reconciled-hardlink";
-    const heading = isManualImport
-      ? "Manually Marked Imported"
-      : (isReconciledHardlink ? "Already Hard Linked in Library" : "Previously Hard Linked");
-    const verb = isManualImport ? "Marked" : (isReconciledHardlink ? "Detected" : "Linked");
-    const importedMessage = isReconciledHardlink
-      ? "NML found matching hard links already present in the media library, so no new action is needed."
-      : "This item is already recorded in Media Linker import tracking.";
+    const heading = importType === "manual" ? "Manually Marked Imported" : "Previously Hard Linked";
+    const verb = importType === "manual" ? "Marked" : "Linked";
 
     setImportButton("Already Imported", true);
     setManualButtons(true);
@@ -672,7 +665,7 @@ function renderImportAdvisor(data) {
           <h3>${escapeHtml(heading)}</h3>
           <span class="status-chip advisor-chip imported">Imported</span>
         </div>
-        <p>${escapeHtml(importedMessage)}</p>
+        <p>This item is already recorded in Media Linker import tracking.</p>
         <p><strong>Destination:</strong><br>${escapeHtml(data.imported.destination || "")}</p>
         <p><strong>${escapeHtml(verb)}:</strong> ${escapeHtml(data.imported.time || "")}</p>
         <p><strong>Import Type:</strong> ${escapeHtml(importType)}</p>

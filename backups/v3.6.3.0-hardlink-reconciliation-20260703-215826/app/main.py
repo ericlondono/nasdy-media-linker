@@ -20,7 +20,6 @@ from app.services.library import find_library_match
 from app.services.advisor import analyze_import
 from app.services.logger import read_log, log
 from app.services.multi_import import build_multi_import_preview, preview_multi_rows, public_multi_import_payload
-from app.services.hardlink_reconcile import reconciled_import_record
 
 app = FastAPI(title=APP_NAME)
 app.mount("/static", StaticFiles(directory="app/static"), name="static")
@@ -297,18 +296,6 @@ async def api_preview(request: Request):
         db = load_import_db()
         source_key = data.get("source_key") or source or ""
         imported = find_import_record(db, source_key, source)
-        if not imported:
-            try:
-                imported = reconciled_import_record(
-                    media_type=media_type,
-                    source=source,
-                    source_key=source_key,
-                    title=title,
-                    year=year,
-                    season=season,
-                )
-            except Exception as reconcile_error:
-                log(f"WARN hardlink reconcile preview skipped: {reconcile_error}")
 
         if imported:
             try:
